@@ -1,0 +1,27 @@
+# Environments
+venv/
+.venv/
+env/
+ENV/
+
+# Project Data
+dataset/
+*.png
+*.json
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# MacOS
+.DS_Store
+
+# User Plans
+Execution_plan.md

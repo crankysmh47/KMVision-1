@@ -1,0 +1,9 @@
+matplotlib
+seaborn
+lifelines
+numpy
+pandas
+pydantic
+albumentations
+tqdm
+opencv-python
