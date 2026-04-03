@@ -165,7 +165,9 @@ def generate_km_chart(output_basename=None):
     )
     
     # Save Image to Disk
-    img_path = os.path.join(OUTPUT_DIR, "images", f"{output_basename}.png")
+    km_img_dir = os.path.join(OUTPUT_DIR, "images", "km")
+    os.makedirs(km_img_dir, exist_ok=True)
+    img_path = os.path.join(km_img_dir, f"{output_basename}.png")
     plt.savefig(img_path, bbox_inches='tight')
     fig.clf()
     plt.close(fig) # Clear specific figure
@@ -173,7 +175,9 @@ def generate_km_chart(output_basename=None):
     gc.collect() # Force garbage collection
     
     # Save JSON Ground Truth to Disk
-    json_path = os.path.join(OUTPUT_DIR, "labels", f"{output_basename}.json")
+    km_lbl_dir = os.path.join(OUTPUT_DIR, "labels", "km")
+    os.makedirs(km_lbl_dir, exist_ok=True)
+    json_path = os.path.join(km_lbl_dir, f"{output_basename}.json")
     try:
         json_output = schema.model_dump_json(indent=2)
     except AttributeError:

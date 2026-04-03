@@ -71,7 +71,9 @@ def generate_forest_plot(output_basename=None):
     ax.set_xlabel(x_label)
     if random.choice([True, False]): ax.grid(True, axis='x', alpha=0.3)
         
-    img_path = os.path.join(OUTPUT_DIR, "images", f"{output_basename}.png")
+    forest_img_dir = os.path.join(OUTPUT_DIR, "images", "forest")
+    os.makedirs(forest_img_dir, exist_ok=True)
+    img_path = os.path.join(forest_img_dir, f"{output_basename}.png")
     plt.tight_layout()
     plt.savefig(img_path, bbox_inches='tight')
     fig.clf()
@@ -80,7 +82,9 @@ def generate_forest_plot(output_basename=None):
     gc.collect()
     
     schema = ForestChartSchema(axes={"x": {"label": x_label}}, studies=studies, overall_effect=overall_effect)
-    with open(os.path.join(OUTPUT_DIR, "labels", f"{output_basename}.json"), 'w') as f:
+    forest_lbl_dir = os.path.join(OUTPUT_DIR, "labels", "forest")
+    os.makedirs(forest_lbl_dir, exist_ok=True)
+    with open(os.path.join(forest_lbl_dir, f"{output_basename}.json"), 'w') as f:
         try: f.write(schema.model_dump_json(indent=2))
         except: f.write(schema.json(indent=2))
 
@@ -117,12 +121,16 @@ def generate_waterfall_plot(output_basename=None):
     y_label = generate_label()
     ax.set_ylabel(y_label)
     
-    img_path = os.path.join(OUTPUT_DIR, "images", f"{output_basename}.png")
+    waterfall_img_dir = os.path.join(OUTPUT_DIR, "images", "waterfall")
+    os.makedirs(waterfall_img_dir, exist_ok=True)
+    img_path = os.path.join(waterfall_img_dir, f"{output_basename}.png")
     plt.tight_layout()
     plt.savefig(img_path, bbox_inches='tight')
     plt.close('all')
     
     schema = WaterfallChartSchema(axes={"y": {"label": y_label}}, bars=bars)
-    with open(os.path.join(OUTPUT_DIR, "labels", f"{output_basename}.json"), 'w') as f:
+    waterfall_lbl_dir = os.path.join(OUTPUT_DIR, "labels", "waterfall")
+    os.makedirs(waterfall_lbl_dir, exist_ok=True)
+    with open(os.path.join(waterfall_lbl_dir, f"{output_basename}.json"), 'w') as f:
         try: f.write(schema.model_dump_json(indent=2))
         except: f.write(schema.json(indent=2))

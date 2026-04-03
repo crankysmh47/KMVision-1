@@ -31,7 +31,7 @@ def worker(task_idx):
 
 def main():
     parser = argparse.ArgumentParser(description="Synthetic Clinical Chart Generation Pipeline")
-    parser.add_argument("--num_samples", type=int, default=100, help="Total number of charts to generate")
+    parser.add_argument("--num_samples", type=int, default=500000, help="Total number of charts to generate")
     args = parser.parse_args()
 
     num_samples = args.num_samples
@@ -54,8 +54,8 @@ def main():
         
     print(f"Completed generation of {num_samples} charts.")
     
-    print("Applying adversarial augmentations to 10% of generated images...")
-    augment_images(r"C:\sem4\KMVision-1 Data\dataset\images", ratio=0.1)
+    print("Applying adversarial augmentations to 20% of generated images...")
+    augment_images(r"C:\sem4\KMVision-1 Data\dataset\images", ratio=0.2)
     
     print("Pipeline finished successfully.")
 

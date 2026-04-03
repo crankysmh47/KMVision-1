@@ -29,13 +29,18 @@ def init_plot(basename):
     return fig, ax
 
 def save_and_close(fig, output_basename, schema):
-    img_path = os.path.join(OUTPUT_DIR, "images", f"{output_basename}.png")
+    chart_type = schema.chart_type
+    img_dir = os.path.join(OUTPUT_DIR, "images", chart_type)
+    os.makedirs(img_dir, exist_ok=True)
+    img_path = os.path.join(img_dir, f"{output_basename}.png")
     plt.savefig(img_path, bbox_inches='tight')
     fig.clf()
     plt.close(fig)
     plt.close('all')
     gc.collect()
-    with open(os.path.join(OUTPUT_DIR, "labels", f"{output_basename}.json"), 'w') as f:
+    lbl_dir = os.path.join(OUTPUT_DIR, "labels", chart_type)
+    os.makedirs(lbl_dir, exist_ok=True)
+    with open(os.path.join(lbl_dir, f"{output_basename}.json"), 'w') as f:
         try: f.write(schema.model_dump_json(indent=2))
         except: f.write(schema.json(indent=2))
 
