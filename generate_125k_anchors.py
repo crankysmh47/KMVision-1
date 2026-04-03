@@ -11,7 +11,7 @@ def worker(idx):
         return False
 
 def run_anchor_batch():
-    total_samples = 125000
+    total_samples = 100000
     print(f"Running targeted batch of {total_samples} Anchor Charts...")
     print("This will process entirely through the 5 synthetic generators (Stacked, Dual-Combo, Bar, Line, Scatter).")
     
