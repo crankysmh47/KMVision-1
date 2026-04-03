@@ -5,8 +5,9 @@ import os, uuid, random, json
 import numpy as np
 import gc
 from schemas import ForestChartSchema, ForestStudy, WaterfallChartSchema, WaterfallBar
+from lexical_engine import generate_label
 
-OUTPUT_DIR = "dataset"
+OUTPUT_DIR = r"C:\sem4\KMVision-1 Data\dataset"
 os.makedirs(os.path.join(OUTPUT_DIR, "images"), exist_ok=True)
 os.makedirs(os.path.join(OUTPUT_DIR, "labels"), exist_ok=True)
 
@@ -37,9 +38,10 @@ def generate_forest_plot(output_basename=None):
     studies = []
     
     y_pos = np.arange(n_studies, 0, -1)
+    study_prefix = random.choice(["Study", "Trial", "Clinic", "Center", "Site", "Hospital"])
     
     for i in range(n_studies):
-        study_label = f"Study {i+1}"
+        study_label = f"{study_prefix} {chr(65+i)}" if random.random() > 0.3 else f"{study_prefix} {random.randint(1, 100)}"
         ratio = max(0.1, random.normalvariate(1.0, 0.4))
         error_margin = random.uniform(0.1, 0.5)
         
@@ -65,7 +67,7 @@ def generate_forest_plot(output_basename=None):
     ax.set_yticks(np.append(y_pos, 0))
     ax.set_yticklabels([s.study_label for s in studies] + ["Overall Effect"])
     
-    x_label = random.choice(["Hazard Ratio (95% CI)", "Odds Ratio (95% CI)", "Relative Risk"])
+    x_label = generate_label()
     ax.set_xlabel(x_label)
     if random.choice([True, False]): ax.grid(True, axis='x', alpha=0.3)
         
@@ -110,8 +112,9 @@ def generate_waterfall_plot(output_basename=None):
     if random.choice([True, False]): ax.axhline(-30, color='red', linestyle='--', alpha=0.6)
     
     ax.set_xticks([])
-    ax.set_xlabel("Patients")
-    y_label = random.choice(["Change from baseline (%)", "Tumor Size Change (%)"])
+    x_label = generate_label()
+    ax.set_xlabel(x_label)
+    y_label = generate_label()
     ax.set_ylabel(y_label)
     
     img_path = os.path.join(OUTPUT_DIR, "images", f"{output_basename}.png")

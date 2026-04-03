@@ -37,8 +37,8 @@ def main():
     num_samples = args.num_samples
     print(f"Generating {num_samples} synthetic charts using {os.cpu_count()} cores...")
 
-    os.makedirs("dataset/images", exist_ok=True)
-    os.makedirs("dataset/labels", exist_ok=True)
+    os.makedirs(r"C:\sem4\KMVision-1 Data\dataset\images", exist_ok=True)
+    os.makedirs(r"C:\sem4\KMVision-1 Data\dataset\labels", exist_ok=True)
 
     import multiprocessing as mp
     
@@ -55,7 +55,7 @@ def main():
     print(f"Completed generation of {num_samples} charts.")
     
     print("Applying adversarial augmentations to 10% of generated images...")
-    augment_images("dataset/images", ratio=0.1)
+    augment_images(r"C:\sem4\KMVision-1 Data\dataset\images", ratio=0.1)
     
     print("Pipeline finished successfully.")
 

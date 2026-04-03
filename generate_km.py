@@ -11,9 +11,10 @@ import gc
 from lifelines import KaplanMeierFitter
 from lifelines.plotting import add_at_risk_counts
 from schemas import KMChartSchema, KMAxes, Axis, KMArm
+from lexical_engine import generate_label
 
 # Optimized Configs
-OUTPUT_DIR = "dataset"
+OUTPUT_DIR = r"C:\sem4\KMVision-1 Data\dataset"
 os.makedirs(os.path.join(OUTPUT_DIR, "images"), exist_ok=True)
 os.makedirs(os.path.join(OUTPUT_DIR, "labels"), exist_ok=True)
 
@@ -69,8 +70,11 @@ def generate_km_chart(output_basename=None):
     include_grid = random.choice([True, False])
     show_risk_table = random.random() < 0.5
     
-    ax.set_ylabel("Survival Probability", fontsize=random.randint(10, 14))
-    ax.set_xlabel("Time (Months)", fontsize=random.randint(10, 14))
+    y_label = generate_label()
+    x_label = generate_label()
+    
+    ax.set_ylabel(y_label, fontsize=random.randint(10, 14))
+    ax.set_xlabel(x_label, fontsize=random.randint(10, 14))
     
     if include_grid:
         ax.grid(True, linestyle=random.choice(['-', '--', ':']), alpha=random.uniform(0.3, 0.7))
@@ -78,6 +82,18 @@ def generate_km_chart(output_basename=None):
     arms_schema = []
     kmfs = []
     
+    style_choice = random.choice(['Treatment', 'Drug', 'Cohort', 'Group', 'Dose'])
+    if style_choice == 'Treatment':
+        arm_labels = [f"Treatment {chr(65+i)}" for i in range(4)]
+    elif style_choice == 'Drug':
+        arm_labels = [f"Drug {chr(88+i)}" for i in range(4)]
+    elif style_choice == 'Cohort':
+        arm_labels = [f"Cohort {i+1}" for i in range(4)]
+    elif style_choice == 'Group':
+        arm_labels = [f"Group {i+1}" for i in range(4)]
+    else:
+        arm_labels = ["Placebo", "Low Dose", "Medium Dose", "High Dose"]
+        
     for i in range(n_arms):
         n_samples = random.randint(50, 200)
         scale = random.uniform(20, 100)
@@ -87,7 +103,7 @@ def generate_km_chart(output_basename=None):
         T, E = generate_arm_data(n_samples, scale, shape, censor_rate)
         
         kmf = KaplanMeierFitter()
-        treatment_label = f"Treatment {chr(65+i)}"
+        treatment_label = arm_labels[i]
         kmf.fit(T, event_observed=E, label=treatment_label)
         kmfs.append(kmf)
         
@@ -142,8 +158,8 @@ def generate_km_chart(output_basename=None):
     # Capture complete schema object
     schema = KMChartSchema(
         axes=KMAxes(
-            x=Axis(label="Time (Months)", max_value=float(x_max)),
-            y=Axis(label="Survival Probability", max_value=1.0)
+            x=Axis(label=x_label, max_value=float(x_max)),
+            y=Axis(label=y_label, max_value=1.0)
         ),
         arms=arms_schema
     )
