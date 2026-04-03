@@ -1,5 +1,5 @@
 from pydantic import BaseModel
-from typing import List, Tuple, Dict, Any
+from typing import List, Tuple, Dict, Any, Union, Optional
 
 class Axis(BaseModel):
     label: str
@@ -40,11 +40,16 @@ class WaterfallChartSchema(BaseModel):
     axes: Dict[str, Any] # e.g., {"y": {"label": "Change from baseline (%)"}}
     bars: List[WaterfallBar]
 
+class AnchorDataPoint(BaseModel):
+    x: Union[str, float]
+    y: float
+
 class AnchorSeries(BaseModel):
-    label: str
-    data_points: List[Tuple[str, float]]
+    series_name: str
+    series_type: str # 'bar', 'line', 'scatter'
+    data: List[AnchorDataPoint]
 
 class AnchorChartSchema(BaseModel):
-    chart_type: str
-    axes: Dict[str, Any]
+    chart_type: str # 'simple_bar', 'stacked_bar', 'multi_line', 'dual_axis_combo', 'scatter'
+    axes: Dict # e.g., {"x": {"label": "..."}, "y1": {"label": "..."}, "y2": {"label": "..."}}
     series: List[AnchorSeries]
