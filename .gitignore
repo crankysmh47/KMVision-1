@@ -31,3 +31,6 @@ real_dataset/images/
 real_dataset/extraction_debug_log.txt
 real_dataset/pmc_ids.txt
 
+
+
+.gitignore
