@@ -27,9 +27,12 @@ __pycache__/
 Execution_plan.md
 
 #Real Dataset
-real_dataset/images/
-real_dataset/extraction_debug_log.txt
-real_dataset/pmc_ids.txt
+real_dataset/images_km/
+real_dataset/images_wf/
+real_dataset/images_forest/
+real_dataset/plos_id_km.txt
+real_dataset/plos_id_wf.txt 
+real_dataset/plos_id_forest.txt
 
 
 
