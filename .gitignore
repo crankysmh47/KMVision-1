@@ -33,6 +33,7 @@ real_dataset/images_forest/
 real_dataset/plos_id_km.txt
 real_dataset/plos_id_wf.txt 
 real_dataset/plos_id_forest.txt
+real_dataset/progress.json
 
 
 
