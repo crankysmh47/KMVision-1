@@ -34,3 +34,5 @@ real_dataset/pmc_ids.txt
 
 
 .gitignore
+
+checkpoints/
