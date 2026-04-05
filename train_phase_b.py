@@ -164,6 +164,7 @@ def main():
     # Projector weights for Phase B initialization (updated per user feedback)
     PROJECTOR_WEIGHTS_PATH = r"C:\sem4\KMVision-1\checkpoints\checkpoints_projector\projector_weights.pth"
     CHECKPOINT_DIR = r"checkpoints/phase_b/"
+    os.makedirs(CHECKPOINT_DIR, exist_ok=True) # Pre-create directory early
     
     BATCH_SIZE = 1
     GRAD_ACCUM_STEPS = 16 
@@ -241,62 +242,82 @@ def main():
     optimizer.zero_grad()
     global_step = 0
     
-    for epoch in range(EPOCHS):
-        total_loss = 0
-        progress_bar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{EPOCHS}")
-        
-        for step, batch in enumerate(progress_bar):
-            pixel_values = batch["pixel_values"].to(device, dtype=torch.bfloat16)
-            input_ids = batch["input_ids"].to(device)
-            attention_mask = batch["attention_mask"].to(device)
-            labels = batch["labels"].to(device)
+    try:
+        for epoch in range(EPOCHS):
+            total_loss = 0
+            progress_bar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{EPOCHS}")
             
-            # Print memory diagnostics for the very first step
-            if step == 0:
-                print(f"\n--- DIAGNOSTICS: Batch max sequence length: {input_ids.shape[1]} + 3645 Global/Local Image patches ---")
+            for step, batch in enumerate(progress_bar):
+                pixel_values = batch["pixel_values"].to(device, dtype=torch.bfloat16)
+                input_ids = batch["input_ids"].to(device)
+                attention_mask = batch["attention_mask"].to(device)
+                labels = batch["labels"].to(device)
                 
-            outputs = model(
-                pixel_values=pixel_values,
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                labels=labels
-            )
-            
-            loss = outputs.loss / GRAD_ACCUM_STEPS
-            loss_val = loss.item() * GRAD_ACCUM_STEPS
-            loss.backward()
-            
-            del outputs, loss
-            
-            if (step + 1) % GRAD_ACCUM_STEPS == 0:
-                optimizer.step()
-                scheduler.step()
-                optimizer.zero_grad()
-                global_step += 1
+                # Print memory diagnostics for the very first step
+                if step == 0:
+                    print(f"\n--- DIAGNOSTICS: Batch max sequence length: {input_ids.shape[1]} + 3645 Global/Local Image patches ---")
+                    
+                outputs = model(
+                    pixel_values=pixel_values,
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    labels=labels
+                )
                 
-                # Clear cache strictly after gradient updates to release massive backward buffers
-                torch.cuda.empty_cache()
+                loss = outputs.loss / GRAD_ACCUM_STEPS
+                loss_val = loss.item() * GRAD_ACCUM_STEPS
+                loss.backward()
                 
-                # Checkpoint every 5,000 steps
-                if global_step % 5000 == 0:
-                    step_dir = os.path.join(CHECKPOINT_DIR, f"step_{global_step}")
-                    os.makedirs(step_dir, exist_ok=True)
-                    print(f"\n[Step {global_step}] Saving intermediate weights...")
-                    model.llm.save_pretrained(step_dir)
-                    torch.save(model.projector.state_dict(), os.path.join(step_dir, "projector_weights.pth"))
+                del outputs, loss
                 
-            if step == 0:
-                mem_alloc = torch.cuda.max_memory_allocated() / 1024**3
-                mem_reserved = torch.cuda.max_memory_reserved() / 1024**3
-                print(f"--- DIAGNOSTICS: Max VRAM Allocated: {mem_alloc:.2f}GB / Reserved: {mem_reserved:.2f}GB ---")
-            
-            total_loss += loss_val
-            current_reserved = torch.cuda.memory_reserved() / 1024**3
-            progress_bar.set_postfix({"loss": loss_val, "vram": f"{current_reserved:.1f}G"})
-            
-            del batch, pixel_values, input_ids, attention_mask, labels
-            
-            # Stage 3: Frequency cache clearing was removed for per-accumulation clearing above.
+                if (step + 1) % GRAD_ACCUM_STEPS == 0:
+                    optimizer.step()
+                    scheduler.step()
+                    optimizer.zero_grad()
+                    global_step += 1
+                    
+                    # Clear cache strictly after gradient updates to release massive backward buffers
+                    torch.cuda.empty_cache()
+                    
+                    # Checkpoint every 250 steps (approx every 4,000 images)
+                    if global_step % 250 == 0:
+                        step_dir = os.path.join(CHECKPOINT_DIR, f"step_{global_step}")
+                        os.makedirs(step_dir, exist_ok=True)
+                        print(f"\n[Step {global_step}] Saving intermediate weights...")
+                        model.llm.save_pretrained(step_dir)
+                        torch.save(model.projector.state_dict(), os.path.join(step_dir, "projector_weights.pth"))
+    
+                    # Check for "save_now.txt" trigger file
+                    if os.path.exists("save_now.txt"):
+                        print(f"\n[TRIGGER] Manual save requested via save_now.txt...")
+                        trigger_dir = os.path.join(CHECKPOINT_DIR, f"manual_step_{global_step}")
+                        os.makedirs(trigger_dir, exist_ok=True)
+                        model.llm.save_pretrained(trigger_dir)
+                        torch.save(model.projector.state_dict(), os.path.join(trigger_dir, "projector_weights.pth"))
+                        os.remove("save_now.txt")
+                        print(f"Manual checkpoint saved to {trigger_dir}")
+                    
+                if step == 0:
+                    mem_alloc = torch.cuda.max_memory_allocated() / 1024**3
+                    mem_reserved = torch.cuda.max_memory_reserved() / 1024**3
+                    print(f"--- DIAGNOSTICS: Max VRAM Allocated: {mem_alloc:.2f}GB / Reserved: {mem_reserved:.2f}GB ---")
+                
+                total_loss += loss_val
+                current_reserved = torch.cuda.memory_reserved() / 1024**3
+                progress_bar.set_postfix({"loss": loss_val, "vram": f"{current_reserved:.1f}G"})
+                
+                del batch, pixel_values, input_ids, attention_mask, labels
+                
+                # Stage 3: Frequency cache clearing was removed for per-accumulation clearing above.
+                
+    except KeyboardInterrupt:
+        print("\n\n[INTRRUPTED] Training stopped by user. Saving emergency checkpoint...")
+        interrupt_dir = os.path.join(CHECKPOINT_DIR, "interrupt_checkpoint")
+        os.makedirs(interrupt_dir, exist_ok=True)
+        model.llm.save_pretrained(interrupt_dir)
+        torch.save(model.projector.state_dict(), os.path.join(interrupt_dir, "projector_weights.pth"))
+        print(f"Emergency weights saved to {interrupt_dir}. Exiting safely.")
+        return # Exit main() safely
                 
     print("\nTraining completed. Saving Phase B weights...")
     final_dir = os.path.join(CHECKPOINT_DIR, "final")
