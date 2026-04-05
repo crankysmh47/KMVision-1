@@ -1,103 +1,144 @@
-import requests
 import os
 import time
-import sys
+import json
+import requests
+from bs4 import BeautifulSoup
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from urllib.parse import urljoin
+from PIL import Image
+import io
 
-# --- Configuration & Debug Settings ---
-TARGET_IMAGES = 500
-IMAGE_DIR = "real_dataset/images"
-LOG_FILE = "real_dataset/extraction_debug_log.txt"
-os.makedirs(IMAGE_DIR, exist_ok=True)
+# --- Persistence Layer ---
+PROGRESS_FILE = "real_dataset/progress.json"
 
-def log_debug(message):
-    """Writes to a log file and prints to terminal for real-time tracking."""
-    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-    formatted_msg = f"[{timestamp}] {message}"
-    print(formatted_msg)
-    with open(LOG_FILE, "a") as f:
-        f.write(formatted_msg + "\n")
+def load_progress():
+    if os.path.exists(PROGRESS_FILE):
+        with open(PROGRESS_FILE, "r") as f:
+            return json.load(f)
+    return {"km": 0, "forest": 0, "wf": 0, "global_total": 0}
 
-def download_high_res_km(pmc_id, global_count):
-    """
-    Directly targets the PMC /bin/ server where high-res figures are stored.
-    Bypasses HTML/Scraping restrictions.
-    """
-    # Note: PMC storage often uses the raw ID (without 'PMC' prefix) for paths
-    clean_id = pmc_id.replace("PMC", "")
-    base_bin_url = f"https://pmc.ncbi.nlm.nih.gov/articles/PMC{clean_id}/bin/"
+def save_progress(chart_type, index, global_total):
+    progress = load_progress()
+    progress[chart_type] = index
+    progress["global_total"] = global_total
+    with open(PROGRESS_FILE, "w") as f:
+        json.dump(progress, f, indent=4)
+
+def get_driver():
+    options = Options()
+    options.add_argument("--headless") 
+    options.add_argument("--window-size=1920,1080")
+    options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    options.add_experimental_option('useAutomationExtension', False)
+    return webdriver.Chrome(options=options)
+
+def scrape_pmc_verified(pmc_id, chart_type, driver, session, current_global_count):
+    target_dir = f"real_dataset/images_{chart_type}"
+    os.makedirs(target_dir, exist_ok=True)
     
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) MedicalDataCollector/1.1'}
+    url = f"https://pmc.ncbi.nlm.nih.gov/articles/{pmc_id}/"
     saved_in_article = 0
 
-    # Journals usually have 1-6 figures. We probe for common naming conventions.
-    # Patterns: F1.jpg (Standard), fig1.jpg (Alternative), F1.png (High-Res)
-    for fig_num in range(1, 7):
-        if global_count + saved_in_article >= TARGET_IMAGES:
-            break
+    try:
+        driver.get(url)
+        wait = WebDriverWait(driver, 15)
+        wait.until(EC.presence_of_element_located((By.TAG_NAME, "img")))
 
-        found_fig = False
-        for ext in ["jpg", "png", "jpeg"]:
-            for prefix in [f"F{fig_num}", f"fig{fig_num}"]:
-                img_url = f"{base_bin_url}{prefix}.{ext}"
-                
-                try:
-                    # Use a HEAD request to check existence without wasting bandwidth
-                    response = requests.head(img_url, headers=headers, timeout=5)
+        for cookie in driver.get_cookies():
+            session.cookies.set(cookie['name'], cookie['value'])
+        
+        driver.execute_script("window.scrollTo(0, document.body.scrollHeight/2);")
+        time.sleep(1)
+
+        soup = BeautifulSoup(driver.page_source, 'html.parser')
+        img_elements = soup.select('figure img, .part-figure img, .fig img')
+
+        for img in img_elements:
+            src = img.get('data-src') or img.get('src')
+            if not src or any(x in src.lower() for x in ["logo", "icon", "google", "button"]):
+                continue
+            
+            full_url = urljoin(url, src)
+            
+            try:
+                img_response = session.get(full_url, timeout=10)
+                if "image" in img_response.headers.get('Content-Type', ''):
+                    image = Image.open(io.BytesIO(img_response.content))
                     
-                    if response.status_code == 200:
-                        # File exists! Now GET the data.
-                        img_data = requests.get(img_url, headers=headers).content
-                        
-                        current_id = global_count + saved_in_article + 1
-                        file_name = f"chart_{current_id:03d}_km.png"
-                        file_path = os.path.join(IMAGE_DIR, file_name)
-                        
-                        with open(file_path, 'wb') as f:
-                            f.write(img_data)
-                        
-                        log_debug(f"SUCCESS: {pmc_id} -> Saved {prefix}.{ext} as {file_name}")
-                        saved_in_article += 1
-                        found_fig = True
-                        break # Found this figure, move to next fig_num
-                except Exception as e:
-                    continue
-            if found_fig: break # Stop checking extensions for this figure number
+                    if image.mode in ("RGBA", "P"):
+                        image = image.convert("RGB")
+                    
+                    # --- NEW NAMING CONVENTION ---
+                    # chart_001_km.png, chart_002_km.png...
+                    file_id = current_global_count + saved_in_article + 1
+                    filename = f"chart_{file_id:03d}_{chart_type}.png"
+                    
+                    image.save(os.path.join(target_dir, filename), "PNG")
+                    print(f"    ✅ Saved: {filename}")
+                    saved_in_article += 1
+            except Exception:
+                continue
 
+    except Exception as e:
+        print(f"    ❌ Error on {pmc_id}: {e}")
+    
     return saved_in_article
 
-# --- Main Execution Loop ---
-if __name__ == "__main__":
-    total_images_saved = 0
-    
-    # Load IDs
-    try:
-        with open("real_dataset/pmc_ids.txt", "r") as f:
-            pmc_ids = [line.strip() for line in f.readlines()]
-    except FileNotFoundError:
-        print("❌ Error: pmc_ids.txt not found. Please run your ID collector script first.")
-        sys.exit()
+# --- Main Execution ---
+TARGETS = {"km": 250, "forest": 125, "wf": 125}
+FILES = {
+    "km": "real_dataset/plos_id_km.txt",
+    "forest": "real_dataset/plos_id_forest.txt",
+    "wf": "real_dataset/plos_id_wf.txt"
+}
 
-    log_debug(f"STARTING EXTRACTION: Goal = {TARGET_IMAGES} images.")
+progress = load_progress()
+driver = get_driver()
+session = requests.Session()
 
-    for index, pmc_id in enumerate(pmc_ids, start=1):
-        if total_images_saved >= TARGET_IMAGES:
-            break
+try:
+    for c_type, target_goal in TARGETS.items():
+        if not os.path.exists(FILES[c_type]): continue
         
-        # Periodic "Milestone" Debugging
-        if index % 10 == 0:
-            log_debug(f"PROGRESS: Processed {index} articles. Total Images: {total_images_saved}/{TARGET_IMAGES}")
-
-        new_count = download_high_res_km(pmc_id, total_images_saved)
-        total_images_saved += new_count
+        with open(FILES[c_type], "r") as f:
+            ids = [line.strip() for line in f.readlines()]
         
-        if new_count == 0:
-            # Silent debug for skipped articles
-            with open(LOG_FILE, "a") as f:
-                f.write(f"[{time.strftime('%H:%M:%S')}] SKIP: {pmc_id} (No KM-style figures found in bin)\n")
+        # Determine starting point for this specific list
+        start_idx = progress.get(c_type, 0)
+        
+        # Count how many images we ALREADY have in this folder
+        target_dir = f"real_dataset/images_{c_type}"
+        os.makedirs(target_dir, exist_ok=True)
+        current_type_total = len([n for n in os.listdir(target_dir) if n.endswith('.png')])
 
-        # Rate Limiting: Stay under the radar
-        time.sleep(1.5)
+        if current_type_total >= target_goal:
+            print(f"🏆 {c_type.upper()} already complete ({current_type_total}/{target_goal}).")
+            continue
 
-    log_debug(f"FINISHED: Total Images Extracted: {total_images_saved}")
-    if total_images_saved < TARGET_IMAGES:
-        log_debug("⚠️ WARNING: Ran out of PMC IDs before hitting 500 images. Collect more IDs!")
+        print(f"\n📂 RESUMING BATCH: {c_type.upper()} from ID index {start_idx}")
+        
+        for i in range(start_idx, len(ids)):
+            if current_type_total >= target_goal:
+                print(f"🎯 Target reached for {c_type}.")
+                break
+            
+            pmc_id = ids[i]
+            print(f"[{i}/{len(ids)}] Probing {pmc_id}...")
+            
+            # Pass the current type total to maintain naming
+            new_saved = scrape_pmc_verified(pmc_id, c_type, driver, session, current_type_total)
+            
+            current_type_total += new_saved
+            
+            # Save progress after every PMC ID processed
+            save_progress(c_type, i + 1, sum(TARGETS.values())) 
+            
+            time.sleep(2)
+
+finally:
+    driver.quit()
+    print(f"\n✨ Session Paused/Finished. Progress saved to {PROGRESS_FILE}")
