@@ -4,6 +4,26 @@ import json
 import re
 from typing import Any, Optional, Tuple
 
+try:
+    import json_repair
+except ImportError:
+    json_repair = None  # type: ignore
+
+
+def repair_truncated_chart_json(text: str) -> str:
+    """
+    Fix outputs that begin mid-schema (common when decoding only new tokens).
+    Example: axes": { ...  ->  {"chart_type": "kaplan_meier", "axes": { ...
+    """
+    t = text.strip()
+    if not t:
+        return t
+    if t.startswith("{"):
+        return t
+    if t.startswith('axes"') or t.startswith("axes"):
+        return '{"chart_type": "kaplan_meier", "' + t
+    return t
+
 
 def extract_json_from_text(text: str) -> Tuple[Optional[dict], Optional[str]]:
     """
@@ -15,7 +35,7 @@ def extract_json_from_text(text: str) -> Tuple[Optional[dict], Optional[str]]:
     if not text or not text.strip():
         return None, "empty output"
 
-    cleaned = text.strip()
+    cleaned = repair_truncated_chart_json(text.strip())
 
     # Strip ```json ... ``` or ``` ... ``` fences
     fence_match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", cleaned, re.IGNORECASE)
@@ -63,5 +83,14 @@ def extract_json_from_text(text: str) -> Tuple[Optional[dict], Optional[str]]:
                         return obj, None
                 except json.JSONDecodeError as e:
                     return None, f"invalid JSON object: {e}"
+
+    if json_repair is not None:
+        try:
+            repaired = repair_truncated_chart_json(cleaned)
+            obj = json.loads(json_repair.repair_json(repaired))
+            if isinstance(obj, dict):
+                return obj, None
+        except (json.JSONDecodeError, TypeError, ValueError):
+            pass
 
     return None, "unbalanced or truncated JSON object"

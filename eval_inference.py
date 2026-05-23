@@ -26,6 +26,8 @@ from transformers import AutoProcessor, AutoTokenizer, BitsAndBytesConfig
 from evaluation.data_index import collect_all_valid_samples
 from evaluation.image_preprocess import pixel_values_from_path
 from evaluation.metrics import aggregate_scores, score_extraction
+from evaluation.parse_output import extract_json_from_text
+from evaluation.schema_compact import try_decompress_prediction
 from model import ClinicalMicroVLM
 
 DEFAULT_DATASET_ROOT = r"C:\sem4\KMVision-1 Data\dataset"
@@ -110,7 +112,6 @@ def generate_extraction(
     pixel_values = pixel_values_from_path(image_path, processor)
     encoded = tokenizer(EXTRACTION_PROMPT, return_tensors="pt", add_special_tokens=True)
     input_ids = encoded.input_ids
-    prompt_len = input_ids.shape[1]
 
     inputs_embeds, attention_mask = build_inputs_embeds(model, pixel_values, input_ids, device)
 
@@ -123,10 +124,13 @@ def generate_extraction(
         eos_token_id=tokenizer.eos_token_id,
     )
 
-    if output_ids.shape[1] > prompt_len:
-        new_ids = output_ids[:, prompt_len:]
+    # With inputs_embeds, generate() returns only *new* token ids — do not strip prompt_len.
+    if input_ids is not None and output_ids.shape[1] > input_ids.shape[1] + 8:
+        # Full sequence returned (prompt + completion): keep completion only.
+        new_ids = output_ids[:, input_ids.shape[1] :]
     else:
         new_ids = output_ids
+
     return tokenizer.decode(new_ids[0], skip_special_tokens=True).strip()
 
 
@@ -164,7 +168,12 @@ def main() -> None:
     parser.add_argument("--category", default=None, help="Limit to one category (e.g. km).")
     parser.add_argument("--max-samples", type=int, default=40, help="Max test images to evaluate.")
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--max-new-tokens", type=int, default=768)
+    parser.add_argument(
+        "--max-new-tokens",
+        type=int,
+        default=2048,
+        help="KM JSON is long; training used 768 total seq len so outputs may still truncate.",
+    )
     parser.add_argument("--output-dir", default="evaluation/results")
     args = parser.parse_args()
 
@@ -221,7 +230,11 @@ def main() -> None:
             prediction_raw = ""
             err = str(e)
 
-        score = score_extraction(ground_truth, prediction_raw)
+        try:
+            expanded = try_decompress_prediction(prediction_raw)
+            score = score_extraction(ground_truth, expanded)
+        except (ValueError, TypeError, KeyError):
+            score = score_extraction(ground_truth, prediction_raw)
         scores.append(score)
 
         records.append(
