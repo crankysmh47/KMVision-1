@@ -1,22 +1,35 @@
+import json
 import os
 import re
-import json
+import sys
+from pathlib import Path
 
-PROGRESS_FILE = "real_dataset/progress.json"
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
 
-def update_json_counts(counts):
-    """Updates the global_total in progress.json to match actual files on disk."""
-    if os.path.exists(PROGRESS_FILE):
-        with open(PROGRESS_FILE, "r") as f:
-            data = json.load(f)
-        
-        # Sync the total to the sum of what actually exists in folders now
-        data["global_total"] = sum(counts.values())
-        
-        with open(PROGRESS_FILE, "w") as f:
-            json.dump(data, f, indent=4)
-        print(f"📊 progress.json updated. New global total: {data['global_total']}")
+from config import PROGRESS_FILE, curated_count, images_dir, inbox_count  # noqa: E402
 
+
+def update_json_counts() -> None:
+    """Sync progress.json downloaded counts with files on disk."""
+    if not PROGRESS_FILE.exists():
+        return
+    with open(PROGRESS_FILE, encoding="utf-8") as handle:
+        data = json.load(handle)
+    data["downloaded"] = {
+        "km": inbox_count("km"),
+        "forest": inbox_count("forest"),
+        "wf": inbox_count("wf"),
+    }
+    data["curated"] = {
+        "km": curated_count("km"),
+        "forest": curated_count("forest"),
+        "wf": curated_count("wf"),
+    }
+    with open(PROGRESS_FILE, "w", encoding="utf-8") as handle:
+        json.dump(data, handle, indent=4)
+    print(f"progress.json updated: {data['downloaded']}")
 def reindex_directory(directory_path, chart_type):
     if not os.path.exists(directory_path):
         return 0
@@ -60,18 +73,17 @@ def reindex_directory(directory_path, chart_type):
 
 # --- Execution ---
 directories = {
-    "km": "real_dataset/images_km",
-    "forest": "real_dataset/images_forest",
-    "wf": "real_dataset/images_wf"
+    "km": images_dir("km"),
+    "forest": images_dir("forest"),
+    "wf": images_dir("wf"),
 }
 
 final_counts = {}
 
-for c_type, path in directories.items():
-    count = reindex_directory(path, c_type)
-    final_counts[c_type] = count
+for chart_type, path in directories.items():
+    count = reindex_directory(str(path), chart_type)
+    final_counts[chart_type] = count
 
-update_json_counts(final_counts)
+update_json_counts()
 
-
-print("\n✨ All gaps closed. Your files are now perfectly sequential (001, 002, 003, 004...).")
+print("\nAll gaps closed. Files are sequential (001, 002, 003, ...).")

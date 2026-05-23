@@ -1,144 +1,246 @@
-import os
-import time
+"""
+Download figure images from PMC articles into the labeling inbox.
+
+New images land in real_dataset/inbox/{km,forest,wf}/ so you can review them
+in labeler.py before promoting accepted charts to images_{type}/.
+
+Usage:
+    python real_dataset/extracter.py
+    python real_dataset/extracter.py --types km --target 250
+"""
+
+from __future__ import annotations
+
+import argparse
+import io
 import json
+import os
+import sys
+import time
+from urllib.parse import urljoin
+
 import requests
 from bs4 import BeautifulSoup
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from urllib.parse import urljoin
 from PIL import Image
-import io
+from selenium import webdriver
+from selenium.common.exceptions import TimeoutException, WebDriverException
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.support.ui import WebDriverWait
+from webdriver_manager.chrome import ChromeDriverManager
 
-# --- Persistence Layer ---
-PROGRESS_FILE = "real_dataset/progress.json"
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+if SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, SCRIPT_DIR)
 
-def load_progress():
-    if os.path.exists(PROGRESS_FILE):
-        with open(PROGRESS_FILE, "r") as f:
-            return json.load(f)
-    return {"km": 0, "forest": 0, "wf": 0, "global_total": 0}
+from config import (  # noqa: E402
+    PMC_ID_FILES,
+    PROGRESS_FILE,
+    TARGETS,
+    curated_count,
+    ensure_dirs,
+    inbox_count,
+    inbox_dir,
+)
 
-def save_progress(chart_type, index, global_total):
+SKIP_URL_FRAGMENTS = ("logo", "icon", "google", "button", "avatar", "banner")
+
+
+def load_progress() -> dict:
+    if PROGRESS_FILE.exists():
+        with open(PROGRESS_FILE, encoding="utf-8") as handle:
+            return json.load(handle)
+    return {"km": 0, "forest": 0, "wf": 0, "downloaded": {"km": 0, "forest": 0, "wf": 0}}
+
+
+def save_progress(chart_type: str, index: int, downloaded: dict[str, int]) -> None:
     progress = load_progress()
     progress[chart_type] = index
-    progress["global_total"] = global_total
-    with open(PROGRESS_FILE, "w") as f:
-        json.dump(progress, f, indent=4)
+    progress["downloaded"] = downloaded
+    with open(PROGRESS_FILE, "w", encoding="utf-8") as handle:
+        json.dump(progress, handle, indent=4)
 
-def get_driver():
+
+def get_driver() -> webdriver.Chrome:
     options = Options()
-    options.add_argument("--headless") 
+    options.add_argument("--headless=new")
     options.add_argument("--window-size=1920,1080")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--disable-blink-features=AutomationControlled")
     options.add_experimental_option("excludeSwitches", ["enable-automation"])
-    options.add_experimental_option('useAutomationExtension', False)
-    return webdriver.Chrome(options=options)
+    options.add_experimental_option("useAutomationExtension", False)
 
-def scrape_pmc_verified(pmc_id, chart_type, driver, session, current_global_count):
-    target_dir = f"real_dataset/images_{chart_type}"
-    os.makedirs(target_dir, exist_ok=True)
-    
+    # Auto-download a ChromeDriver build matching the installed Chrome (e.g. 148.x).
+    service = Service(ChromeDriverManager().install())
+    return webdriver.Chrome(service=service, options=options)
+
+
+def restart_driver(driver: webdriver.Chrome | None) -> webdriver.Chrome:
+    if driver is not None:
+        try:
+            driver.quit()
+        except Exception:
+            pass
+    return get_driver()
+
+
+def next_filename(chart_type: str, current_count: int, saved_in_article: int) -> str:
+    file_id = current_count + saved_in_article + 1
+    return f"raw_{file_id:04d}_{chart_type}.png"
+
+
+def scrape_pmc_verified(
+    pmc_id: str,
+    chart_type: str,
+    driver: webdriver.Chrome,
+    session: requests.Session,
+    current_count: int,
+    seen_urls: set[str],
+) -> int:
+    target_dir = inbox_dir(chart_type)
+    ensure_dirs(chart_type)
+
     url = f"https://pmc.ncbi.nlm.nih.gov/articles/{pmc_id}/"
     saved_in_article = 0
 
     try:
         driver.get(url)
-        wait = WebDriverWait(driver, 15)
-        wait.until(EC.presence_of_element_located((By.TAG_NAME, "img")))
+        wait = WebDriverWait(driver, 20)
+        try:
+            wait.until(EC.presence_of_element_located((By.TAG_NAME, "img")))
+        except TimeoutException:
+            wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
 
         for cookie in driver.get_cookies():
-            session.cookies.set(cookie['name'], cookie['value'])
-        
-        driver.execute_script("window.scrollTo(0, document.body.scrollHeight/2);")
-        time.sleep(1)
+            session.cookies.set(cookie["name"], cookie["value"])
 
-        soup = BeautifulSoup(driver.page_source, 'html.parser')
-        img_elements = soup.select('figure img, .part-figure img, .fig img')
+        driver.execute_script("window.scrollTo(0, document.body.scrollHeight / 2);")
+        time.sleep(1.5)
+
+        soup = BeautifulSoup(driver.page_source, "html.parser")
+        img_elements = soup.select("figure img, .part-figure img, .fig img")
 
         for img in img_elements:
-            src = img.get('data-src') or img.get('src')
-            if not src or any(x in src.lower() for x in ["logo", "icon", "google", "button"]):
+            src = img.get("data-src") or img.get("src")
+            if not src or any(fragment in src.lower() for fragment in SKIP_URL_FRAGMENTS):
                 continue
-            
+
             full_url = urljoin(url, src)
-            
+            if full_url in seen_urls:
+                continue
+
             try:
                 img_response = session.get(full_url, timeout=10)
-                if "image" in img_response.headers.get('Content-Type', ''):
-                    image = Image.open(io.BytesIO(img_response.content))
-                    
-                    if image.mode in ("RGBA", "P"):
-                        image = image.convert("RGB")
-                    
-                    # --- NEW NAMING CONVENTION ---
-                    # chart_001_km.png, chart_002_km.png...
-                    file_id = current_global_count + saved_in_article + 1
-                    filename = f"chart_{file_id:03d}_{chart_type}.png"
-                    
-                    image.save(os.path.join(target_dir, filename), "PNG")
-                    print(f"    ✅ Saved: {filename}")
-                    saved_in_article += 1
+                content_type = img_response.headers.get("Content-Type", "")
+                if "image" not in content_type:
+                    continue
+
+                image = Image.open(io.BytesIO(img_response.content))
+                if image.width < 120 or image.height < 120:
+                    continue
+
+                if image.mode in ("RGBA", "P"):
+                    image = image.convert("RGB")
+
+                filename = next_filename(chart_type, current_count, saved_in_article)
+                image.save(target_dir / filename, "PNG")
+                seen_urls.add(full_url)
+                print(f"    saved: {filename}")
+                saved_in_article += 1
             except Exception:
                 continue
 
-    except Exception as e:
-        print(f"    ❌ Error on {pmc_id}: {e}")
-    
+    except Exception as exc:
+        print(f"    error on {pmc_id}: {exc}")
+
     return saved_in_article
 
-# --- Main Execution ---
-TARGETS = {"km": 250, "forest": 125, "wf": 125}
-FILES = {
-    "km": "real_dataset/plos_id_km.txt",
-    "forest": "real_dataset/plos_id_forest.txt",
-    "wf": "real_dataset/plos_id_wf.txt"
-}
 
-progress = load_progress()
-driver = get_driver()
-session = requests.Session()
+def run_extraction(types: list[str], targets: dict[str, int], delay: float) -> None:
+    progress = load_progress()
+    driver = get_driver()
+    session = requests.Session()
+    seen_urls: set[str] = set()
+    consecutive_driver_errors = 0
 
-try:
-    for c_type, target_goal in TARGETS.items():
-        if not os.path.exists(FILES[c_type]): continue
-        
-        with open(FILES[c_type], "r") as f:
-            ids = [line.strip() for line in f.readlines()]
-        
-        # Determine starting point for this specific list
-        start_idx = progress.get(c_type, 0)
-        
-        # Count how many images we ALREADY have in this folder
-        target_dir = f"real_dataset/images_{c_type}"
-        os.makedirs(target_dir, exist_ok=True)
-        current_type_total = len([n for n in os.listdir(target_dir) if n.endswith('.png')])
+    try:
+        for chart_type in types:
+            id_file = PMC_ID_FILES[chart_type]
+            if not id_file.exists():
+                print(f"Skipping {chart_type}: missing {id_file}")
+                continue
 
-        if current_type_total >= target_goal:
-            print(f"🏆 {c_type.upper()} already complete ({current_type_total}/{target_goal}).")
-            continue
+            with open(id_file, encoding="utf-8") as handle:
+                ids = [line.strip() for line in handle if line.strip()]
 
-        print(f"\n📂 RESUMING BATCH: {c_type.upper()} from ID index {start_idx}")
-        
-        for i in range(start_idx, len(ids)):
-            if current_type_total >= target_goal:
-                print(f"🎯 Target reached for {c_type}.")
-                break
-            
-            pmc_id = ids[i]
-            print(f"[{i}/{len(ids)}] Probing {pmc_id}...")
-            
-            # Pass the current type total to maintain naming
-            new_saved = scrape_pmc_verified(pmc_id, c_type, driver, session, current_type_total)
-            
-            current_type_total += new_saved
-            
-            # Save progress after every PMC ID processed
-            save_progress(c_type, i + 1, sum(TARGETS.values())) 
-            
-            time.sleep(2)
+            target_goal = targets[chart_type]
+            current_total = inbox_count(chart_type)
+            curated = curated_count(chart_type)
+            start_idx = progress.get(chart_type, 0)
 
-finally:
-    driver.quit()
-    print(f"\n✨ Session Paused/Finished. Progress saved to {PROGRESS_FILE}")
+            if current_total >= target_goal:
+                print(f"{chart_type.upper()} inbox already at {current_total}/{target_goal} (curated: {curated}, untouched)")
+                continue
+
+            print(
+                f"\nCollecting {chart_type.upper()} into inbox/ from PMC index {start_idx} "
+                f"(inbox {current_total}/{target_goal}, curated {curated} in images_{chart_type}/ — not touched)"
+            )
+
+            for i in range(start_idx, len(ids)):
+                if current_total >= target_goal:
+                    print(f"Target reached for {chart_type}.")
+                    break
+
+                pmc_id = ids[i]
+                print(f"[{i + 1}/{len(ids)}] {pmc_id} ...")
+                try:
+                    new_saved = scrape_pmc_verified(
+                        pmc_id, chart_type, driver, session, current_total, seen_urls
+                    )
+                    consecutive_driver_errors = 0
+                except WebDriverException as exc:
+                    consecutive_driver_errors += 1
+                    print(f"    driver error on {pmc_id}: {exc}")
+                    new_saved = 0
+                    if consecutive_driver_errors >= 2:
+                        print("    restarting ChromeDriver ...")
+                        driver = restart_driver(driver)
+                        session = requests.Session()
+                        consecutive_driver_errors = 0
+
+                current_total += new_saved
+
+                downloaded = progress.get("downloaded", {"km": 0, "forest": 0, "wf": 0})
+                downloaded[chart_type] = current_total
+                save_progress(chart_type, i + 1, downloaded)
+                time.sleep(delay)
+
+    finally:
+        driver.quit()
+        print(f"\nSession finished. Progress saved to {PROGRESS_FILE}")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Bulk download PMC figure images")
+    parser.add_argument("--types", nargs="+", default=["km", "forest", "wf"], choices=["km", "forest", "wf"])
+    parser.add_argument("--target-km", type=int, default=TARGETS["km"])
+    parser.add_argument("--target-forest", type=int, default=TARGETS["forest"])
+    parser.add_argument("--target-wf", type=int, default=TARGETS["wf"])
+    parser.add_argument("--delay", type=float, default=2.0, help="Seconds between PMC articles")
+    args = parser.parse_args()
+
+    targets = {
+        "km": args.target_km,
+        "forest": args.target_forest,
+        "wf": args.target_wf,
+    }
+    run_extraction(args.types, targets, args.delay)
+
+
+if __name__ == "__main__":
+    main()

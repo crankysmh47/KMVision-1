@@ -6,4 +6,9 @@ pandas
 pydantic
 albumentations
 tqdm
-opencv-python
+# Real-world dataset collection
+requests
+beautifulsoup4
+selenium
+webdriver-manager
+Pillow
