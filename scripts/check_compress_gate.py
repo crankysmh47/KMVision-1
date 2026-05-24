@@ -1,6 +1,8 @@
 """
 Verify compressed labels fit the 768-token training budget before week queue training.
 
+Uses the same tokenization path as train_phase_c (precompressed_fits_token_budget).
+
 Usage:
   python scripts/check_compress_gate.py
   python scripts/check_compress_gate.py --label-dir "C:\\...\\labels_compressed"
@@ -19,9 +21,10 @@ sys.path.insert(0, ROOT)
 
 from transformers import AutoTokenizer
 
+from evaluation.schema_compact import precompressed_fits_token_budget
+
 DEFAULT_GATES = os.path.join(ROOT, "config", "eval_gates.json")
 DEFAULT_LABEL_DIR = r"C:\sem4\KMVision-1 Data\dataset\labels_compressed"
-PROMPT = "\nExtract the underlying data from this clinical chart in strict JSON format.\n"
 MAX_LENGTH = 768
 
 
@@ -35,10 +38,6 @@ def collect_by_category(label_dir: str) -> dict[str, list[str]]:
             if name.endswith(".json"):
                 by_cat.setdefault(cat, []).append(os.path.join(root, name))
     return by_cat
-
-
-def token_len(tokenizer, text: str) -> int:
-    return len(tokenizer(text, add_special_tokens=True).input_ids)
 
 
 def main() -> int:
@@ -74,21 +73,25 @@ def main() -> int:
         sample = rng.sample(paths, sample_n)
         over = 0
         for path in sample:
-            with open(path, encoding="utf-8") as f:
-                body = f.read()
-            text = PROMPT + body + tokenizer.eos_token
-            if token_len(tokenizer, text) > MAX_LENGTH:
+            try:
+                with open(path, encoding="utf-8", errors="replace") as f:
+                    obj = json.load(f)
+            except json.JSONDecodeError:
+                over += 1
+                continue
+            if not precompressed_fits_token_budget(obj, tokenizer, max_length=MAX_LENGTH):
                 over += 1
         frac = over / sample_n if sample_n else 1.0
         max_frac = cfg.get("max_fraction_over_768", 0.05)
-        print(f"  {cat}: {over}/{sample_n} over 768 ({frac:.1%}), max allowed {max_frac:.1%}")
+        print(f"  {cat}: {over}/{sample_n} over {MAX_LENGTH} ({frac:.1%}), max allowed {max_frac:.1%}")
         if frac > max_frac:
             failures.append(f"{cat}: {frac:.1%} over budget > {max_frac:.1%}")
 
     if failures:
         print("COMPRESS GATE FAILED:")
-        for f in failures:
-            print(f"  - {f}")
+        for msg in failures:
+            print(f"  - {msg}")
+        print("Re-run: python scripts/compress_labels.py --category km")
         return 1
 
     print("COMPRESS GATE PASSED")
