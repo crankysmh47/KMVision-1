@@ -1,0 +1,54 @@
+{
+  "description": "Automated eval gates for run_week_queue.bat. Metrics are 0-1 unless noted.",
+  "baseline_summary": "config/phase_b_baseline_summary.json",
+  "compress_gate": {
+    "sample_size": 200,
+    "max_fraction_over_768": 0.05,
+    "categories_required": ["km"]
+  },
+  "runs": {
+    "run1": {
+      "absolute_minimums": {
+        "json_valid_rate": 0.70,
+        "chart_type_accuracy": 0.75,
+        "mean_overall_score": 0.45,
+        "mean_structure_score": 0.25,
+        "mean_numeric_score": 0.35
+      },
+      "vs_baseline_min_delta": {
+        "mean_overall_score": -0.05,
+        "mean_structure_score": 0.0,
+        "json_valid_rate": 0.0
+      }
+    },
+    "run2": {
+      "absolute_minimums": {
+        "json_valid_rate": 0.75,
+        "chart_type_accuracy": 0.80,
+        "mean_overall_score": 0.48,
+        "mean_structure_score": 0.30
+      },
+      "vs_previous_min_relative": 0.92,
+      "vs_previous_metrics": [
+        "mean_overall_score",
+        "json_valid_rate",
+        "mean_structure_score"
+      ]
+    },
+    "run3": {
+      "absolute_minimums": {
+        "json_valid_rate": 0.80,
+        "chart_type_accuracy": 0.85,
+        "mean_overall_score": 0.50,
+        "mean_structure_score": 0.35
+      },
+      "vs_previous_min_relative": 0.95,
+      "vs_previous_metrics": [
+        "mean_overall_score",
+        "json_valid_rate",
+        "mean_structure_score",
+        "mean_censoring_score"
+      ]
+    }
+  }
+}

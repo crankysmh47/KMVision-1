@@ -78,11 +78,27 @@ A short Phase C smoke run (~18 global steps) confirmed stability (~12.4 GB VRAM,
 
 ## Commands
 
-### Start Phase C training (from repo root)
+### Full week queue (chained + automated gates)
+
+```bat
+cd c:\sem4\KMVision-1
+run_week_queue.bat
+```
+
+1. `compress_labels` → `check_compress_gate`
+2. **Run 1** (`phase_b/final` → minified) → eval → gate vs Phase B baseline
+3. **Run 2** (`run1/final` → ChatML) → eval → gate vs run1 (≥92% on key metrics)
+4. **Run 3** (`run2/final` → ChatML, lr 1e-5) → eval → gate vs run2 (≥95%)
+
+Thresholds: `config/eval_gates.json`. Gate reports: `evaluation/results/runN_*/gate_runN.json`.  
+On failure the queue **stops**; logs in `logs/week_queue/`.
+
+### Start Phase C training only (single run)
 
 ```powershell
 cd c:\sem4\KMVision-1
-python train_phase_c.py 2>&1 | Tee-Object -FilePath phase_c_training.log
+python scripts\compress_labels.py
+python train_phase_c.py --subset_size 30000 --learning_rate 5e-5 --output_dir checkpoints/phase_c_run1_minified
 ```
 
 ### Monitor
@@ -132,5 +148,8 @@ python eval_inference.py --checkpoint checkpoints/phase_c/step_250 --category km
 | `evaluation/schema_compact.py` | Minify / decompress labels |
 | `evaluation/metrics.py` | Eval scoring |
 | `eval_inference.py` | Inference + eval |
-| `scripts/organize_train_test.py` | Build train_1 / testing split |
-| `scripts/archive_phase_b_baseline.py` | Archive baseline artifacts |
+| `scripts/check_eval_gate.py` | Automated eval metric pass/fail |
+| `scripts/check_compress_gate.py` | Pre-train label token budget gate |
+| `scripts/verify_checkpoint.py` | Verify final/ checkpoint files exist |
+| `config/eval_gates.json` | Thresholds for week queue gates |
+| `run_week_queue.bat` | Chained 3-run pipeline |

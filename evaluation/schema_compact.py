@@ -127,7 +127,13 @@ def decompress_km(obj: dict) -> dict:
     x_ax, y_ax = ax.get("x", {}), ax.get("y", {})
     arms = []
     for arm in obj.get("a", []):
-        coords = [_round_coord(p) for p in arm.get("p", [])]
+        if "t" in arm and "s" in arm:
+            coords = [
+                [float(t), float(s)]
+                for t, s in zip(arm.get("t", []), arm.get("s", []))
+            ]
+        else:
+            coords = [_round_coord(p) for p in arm.get("p", [])]
         arms.append(
             {
                 "treatment_label": arm.get("id", ""),
@@ -259,6 +265,66 @@ def compact_fits_token_budget(
 ) -> bool:
     text = prompt + compact_json_string(verbose_obj) + tokenizer.eos_token
     return len(tokenizer(text, add_special_tokens=True).input_ids) <= max_length
+
+
+def precompressed_fits_token_budget(
+    compressed_obj: dict,
+    tokenizer,
+    *,
+    prompt: str = "\nExtract the underlying data from this clinical chart in strict JSON format.\n",
+    max_length: int = 768,
+    use_chatml: bool = False,
+) -> bool:
+    target = json.dumps(compressed_obj, separators=(",", ":"))
+    text = build_training_text(prompt, target, tokenizer, use_chatml=use_chatml)
+    return len(tokenizer(text, add_special_tokens=True).input_ids) <= max_length
+
+
+def build_training_text(
+    user_prompt: str,
+    target_json: str,
+    tokenizer,
+    *,
+    use_chatml: bool = False,
+) -> str:
+    """Plain prompt+JSON or Qwen ChatML (user/assistant) training string."""
+    if not use_chatml:
+        return user_prompt + target_json + tokenizer.eos_token
+    user_block = user_prompt.strip()
+    messages = [
+        {"role": "user", "content": user_block},
+        {"role": "assistant", "content": target_json},
+    ]
+    try:
+        return tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=False
+        ) + tokenizer.eos_token
+    except Exception:
+        return (
+            f"<|im_start|>user\n{user_block}\n\n"
+            f"<|im_start|>assistant\n{target_json}\n"
+        )
+
+
+def prompt_mask_length(
+    user_prompt: str,
+    tokenizer,
+    *,
+    use_chatml: bool = False,
+) -> int:
+    """Token length to mask (prompt only, excluding target JSON)."""
+    if not use_chatml:
+        return tokenizer(user_prompt, add_special_tokens=False, return_tensors="pt").input_ids.shape[1]
+    user_block = user_prompt.strip()
+    try:
+        prefix = tokenizer.apply_chat_template(
+            [{"role": "user", "content": user_block}],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+    except Exception:
+        prefix = f"<|im_start|>user\n{user_block}\n\n<|im_start|>assistant\n"
+    return len(tokenizer(prefix, add_special_tokens=True).input_ids)
 
 
 def compact_json_string(verbose_obj: dict) -> str:

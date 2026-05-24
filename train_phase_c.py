@@ -1,3 +1,4 @@
+import argparse
 import os
 
 import torch
@@ -12,11 +13,16 @@ from PIL import Image
 import bitsandbytes as bnb
 
 from model import ClinicalMicroVLM
-from evaluation.schema_compact import compact_fits_token_budget, compact_json_string
+from evaluation.schema_compact import (
+    build_training_text,
+    precompressed_fits_token_budget,
+    prompt_mask_length,
+)
 
 EXTRACTION_PROMPT = "\nExtract the underlying data from this clinical chart in strict JSON format.\n"
 CLASSIFY_PROMPT = "\nClassify this chart type. Output only the exact schema name.\n"
 CORRUPT_LOG = "corrupted_images.log"
+DEFAULT_DATASET_ROOT = r"C:\sem4\KMVision-1 Data\dataset"
 
 
 def _utc_now() -> str:
@@ -24,7 +30,6 @@ def _utc_now() -> str:
 
 
 def _delete_corrupt_pair(img_path: str, label_path: str, error: Exception) -> None:
-    """Log and delete corrupt image/label so training never stalls on them again."""
     line = f"{_utc_now()}\t{img_path}\t{label_path}\t{error}\n"
     with open(CORRUPT_LOG, "a", encoding="utf-8") as err_log:
         err_log.write(line)
@@ -44,13 +49,11 @@ def _save_checkpoint(
     *,
     folder_name: str | None = None,
 ) -> str:
-    """Save LoRA adapter + projector and write a small metadata sidecar."""
     step_dir = os.path.join(checkpoint_dir, folder_name or f"step_{global_step}")
     os.makedirs(step_dir, exist_ok=True)
     model.llm.save_pretrained(step_dir)
     projector_path = os.path.join(step_dir, "projector_weights.pth")
     torch.save(model.projector.state_dict(), projector_path)
-
     meta = {
         "global_step": global_step,
         "loss": loss_val,
@@ -58,22 +61,32 @@ def _save_checkpoint(
         "adapter_dir": step_dir,
         "projector_weights": projector_path,
     }
-    meta_path = os.path.join(step_dir, "checkpoint_meta.json")
-    with open(meta_path, "w", encoding="utf-8") as f:
+    with open(os.path.join(step_dir, "checkpoint_meta.json"), "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)
-
-    adapter_file = os.path.join(step_dir, "adapter_model.safetensors")
-    if not os.path.isfile(projector_path) or not os.path.isfile(adapter_file):
+    if not os.path.isfile(projector_path) or not os.path.isfile(
+        os.path.join(step_dir, "adapter_model.safetensors")
+    ):
         raise RuntimeError(f"Checkpoint incomplete at {step_dir}")
     return step_dir
 
 
 class CompactChartDataset(Dataset):
-    """Phase C: verbose labels on disk, compact JSON as training target."""
+    """Phase C: pre-compressed labels on disk (labels_compressed/)."""
 
-    def __init__(self, image_dir, label_dir, processor, tokenizer, max_samples=30000, seed=42):
+    def __init__(
+        self,
+        image_dir,
+        label_dir,
+        processor,
+        tokenizer,
+        *,
+        max_samples=30000,
+        seed=42,
+        use_chatml=False,
+    ):
         self.processor = processor
         self.tokenizer = tokenizer
+        self.use_chatml = use_chatml
         category_samples = {}
 
         if not os.path.isdir(image_dir) or not os.path.isdir(label_dir):
@@ -120,7 +133,9 @@ class CompactChartDataset(Dataset):
                     continue
                 with open(label_path, encoding="utf-8", errors="replace") as f:
                     obj = json.load(f)
-                if compact_fits_token_budget(obj, tokenizer):
+                if precompressed_fits_token_budget(
+                    obj, tokenizer, use_chatml=use_chatml
+                ):
                     self.samples.append((img_path, label_path))
                 else:
                     skipped_budget += 1
@@ -131,7 +146,7 @@ class CompactChartDataset(Dataset):
         print(
             f"Phase C dataset: {len(self.samples)} samples fit 768-token budget "
             f"({skipped_budget} over budget, {skipped_corrupt} corrupt/missing, "
-            f"{num_categories} categories)."
+            f"{num_categories} categories, chatml={use_chatml})."
         )
         if not self.samples:
             raise ValueError("No samples fit the compact token budget.")
@@ -167,14 +182,15 @@ class CompactChartDataset(Dataset):
                 ).pixel_values
 
                 with open(label_path, encoding="utf-8", errors="replace") as f:
-                    verbose_obj = json.load(f)
+                    compressed_obj = json.load(f)
 
                 if random.random() < 0.05:
                     user_prompt = CLASSIFY_PROMPT
-                    target_json = verbose_obj.get("chart_type", "unknown")
+                    ct = compressed_obj.get("ct", compressed_obj.get("chart_type", "unknown"))
+                    target_json = str(ct)
                 else:
                     user_prompt = EXTRACTION_PROMPT
-                    target_json = compact_json_string(verbose_obj)
+                    target_json = json.dumps(compressed_obj, separators=(",", ":"))
 
             except Exception as e:
                 print(f"\nWARNING: Removing corrupt sample {img_path}: {e}")
@@ -183,7 +199,9 @@ class CompactChartDataset(Dataset):
                 attempts += 1
                 continue
 
-            full_text = user_prompt + target_json + self.tokenizer.eos_token
+            full_text = build_training_text(
+                user_prompt, target_json, self.tokenizer, use_chatml=self.use_chatml
+            )
             encoded = self.tokenizer(
                 full_text,
                 truncation=True,
@@ -194,9 +212,9 @@ class CompactChartDataset(Dataset):
             input_ids = encoded.input_ids.squeeze(0)
             attention_mask = encoded.attention_mask.squeeze(0)
             labels = input_ids.clone()
-            prompt_len = self.tokenizer(
-                user_prompt, add_special_tokens=False, return_tensors="pt"
-            ).input_ids.shape[1]
+            prompt_len = prompt_mask_length(
+                user_prompt, self.tokenizer, use_chatml=self.use_chatml
+            )
             labels[:prompt_len] = -100
             labels[attention_mask == 0] = -100
 
@@ -210,22 +228,70 @@ class CompactChartDataset(Dataset):
         raise RuntimeError(f"Too many consecutive corrupt samples near index {idx}.")
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="Phase C: compact JSON fine-tuning from Phase B final.")
+    parser.add_argument("--subset_size", type=int, default=30000)
+    parser.add_argument("--learning_rate", type=float, default=5e-5)
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default="checkpoints/phase_c",
+        help="Directory for step_* and final checkpoints.",
+    )
+    parser.add_argument(
+        "--use_chatml",
+        action="store_true",
+        help="Wrap prompt/target in Qwen ChatML (<|im_start|> user/assistant).",
+    )
+    parser.add_argument(
+        "--dataset_root",
+        type=str,
+        default=DEFAULT_DATASET_ROOT,
+        help="Root of KMVision dataset on disk.",
+    )
+    parser.add_argument(
+        "--image_dir",
+        type=str,
+        default=None,
+        help="Override image directory (default: {dataset_root}/train_1/images).",
+    )
+    parser.add_argument(
+        "--label_dir",
+        type=str,
+        default=None,
+        help="Override label directory (default: {dataset_root}/labels_compressed).",
+    )
+    parser.add_argument(
+        "--init_checkpoint",
+        type=str,
+        default="checkpoints/phase_b/final",
+        help="Phase B checkpoint to continue from.",
+    )
+    parser.add_argument("--max_global_steps", type=int, default=2000)
+    parser.add_argument("--checkpoint_every", type=int, default=250)
+    parser.add_argument("--seed", type=int, default=42)
+    return parser.parse_args()
+
+
 def main():
-    IMAGE_DIR = r"C:\sem4\KMVision-1 Data\dataset\train_1\images"
-    LABEL_DIR = r"C:\sem4\KMVision-1 Data\dataset\train_1\labels"
-    PHASE_B_FINAL = r"checkpoints/phase_b/final"
-    CHECKPOINT_DIR = r"checkpoints/phase_c/"
-    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+    args = parse_args()
+    image_dir = args.image_dir or os.path.join(args.dataset_root, "train_1", "images")
+    label_dir = args.label_dir or os.path.join(args.dataset_root, "labels_compressed")
+    os.makedirs(args.output_dir, exist_ok=True)
 
     BATCH_SIZE = 1
     GRAD_ACCUM_STEPS = 16
-    LEARNING_RATE = 5e-5
-    SUBSET_SIZE = 30000
-    MAX_GLOBAL_STEPS = 2000
-    CHECKPOINT_EVERY = 250
 
     device = torch.device("cuda:0")
     print(f"Phase C on device: {device}")
+    print(f"  images:     {image_dir}")
+    print(f"  labels:     {label_dir}")
+    print(f"  output:     {args.output_dir}")
+    print(f"  init:       {args.init_checkpoint}")
+    print(f"  subset:     {args.subset_size}")
+    print(f"  lr:         {args.learning_rate}")
+    print(f"  chatml:     {args.use_chatml}")
+
     try:
         torch.empty(1, device=device)
     except Exception as e:
@@ -248,46 +314,50 @@ def main():
         bnb_4bit_quant_type="nf4",
     )
 
-    print("Loading ClinicalMicroVLM + Phase B final adapter...")
-    model = ClinicalMicroVLM(bnb_config=bnb_config)
-    model.vision_encoder.requires_grad_(False)
-
-    if not os.path.isdir(PHASE_B_FINAL):
-        print(f"FATAL: Phase B checkpoint missing at {PHASE_B_FINAL}")
+    if not os.path.isdir(args.init_checkpoint):
+        print(f"FATAL: init checkpoint missing: {args.init_checkpoint}")
         return
 
-    model.llm = PeftModel.from_pretrained(model.llm, PHASE_B_FINAL, is_trainable=True)
+    print("Loading ClinicalMicroVLM + init adapter...")
+    model = ClinicalMicroVLM(bnb_config=bnb_config)
+    model.vision_encoder.requires_grad_(False)
+    model.llm = PeftModel.from_pretrained(model.llm, args.init_checkpoint, is_trainable=True)
     model.llm.gradient_checkpointing_enable()
     model.llm.config.use_cache = False
     model.projector.requires_grad_(True)
-
-    projector_path = os.path.join(PHASE_B_FINAL, "projector_weights.pth")
-    model.projector.load_state_dict(torch.load(projector_path, map_location=device))
-
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Trainable parameters: {trainable_params:,}")
+    model.projector.load_state_dict(
+        torch.load(
+            os.path.join(args.init_checkpoint, "projector_weights.pth"),
+            map_location=device,
+        )
+    )
 
     model.vision_encoder = model.vision_encoder.to(device)
     model.projector = model.projector.to(device)
 
     optimizer = bnb.optim.PagedAdamW8bit(
-        filter(lambda p: p.requires_grad, model.parameters()), lr=LEARNING_RATE
+        filter(lambda p: p.requires_grad, model.parameters()), lr=args.learning_rate
     )
 
     dataset = CompactChartDataset(
-        IMAGE_DIR, LABEL_DIR, processor, tokenizer, max_samples=SUBSET_SIZE, seed=42
+        image_dir,
+        label_dir,
+        processor,
+        tokenizer,
+        max_samples=args.subset_size,
+        seed=args.seed,
+        use_chatml=args.use_chatml,
     )
     dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
 
-    total_steps = min(len(dataloader) // GRAD_ACCUM_STEPS, MAX_GLOBAL_STEPS)
+    total_steps = min(len(dataloader) // GRAD_ACCUM_STEPS, args.max_global_steps)
     scheduler = get_linear_schedule_with_warmup(
         optimizer,
         num_warmup_steps=max(1, int(0.05 * total_steps)),
         num_training_steps=total_steps,
     )
 
-    print(f"\n--- Phase C: compact JSON, up to {MAX_GLOBAL_STEPS} optimizer steps ---")
-    print(f"Checkpoints every {CHECKPOINT_EVERY} steps -> {CHECKPOINT_DIR}")
+    print(f"\n--- Phase C: up to {args.max_global_steps} optimizer steps ---")
     model.train()
     torch.cuda.empty_cache()
     optimizer.zero_grad()
@@ -297,7 +367,7 @@ def main():
     try:
         progress_bar = tqdm(dataloader, desc="Phase C")
         for step, batch in enumerate(progress_bar):
-            if global_step >= MAX_GLOBAL_STEPS:
+            if global_step >= args.max_global_steps:
                 break
 
             pixel_values = batch["pixel_values"].to(device, dtype=torch.bfloat16)
@@ -327,14 +397,14 @@ def main():
                 global_step += 1
                 torch.cuda.empty_cache()
 
-                if global_step % CHECKPOINT_EVERY == 0:
-                    saved = _save_checkpoint(model, CHECKPOINT_DIR, global_step, loss_val)
+                if global_step % args.checkpoint_every == 0:
+                    saved = _save_checkpoint(model, args.output_dir, global_step, loss_val)
                     print(f"\n[Step {global_step}] Checkpoint saved -> {saved}")
 
                 if os.path.exists("save_now.txt"):
                     saved = _save_checkpoint(
                         model,
-                        CHECKPOINT_DIR,
+                        args.output_dir,
                         global_step,
                         loss_val,
                         folder_name=f"manual_step_{global_step}",
@@ -352,20 +422,13 @@ def main():
 
     except KeyboardInterrupt:
         print("\nInterrupted — saving emergency checkpoint...")
-        interrupt_dir = os.path.join(CHECKPOINT_DIR, "interrupt_checkpoint")
+        interrupt_dir = os.path.join(args.output_dir, "interrupt_checkpoint")
         os.makedirs(interrupt_dir, exist_ok=True)
         model.llm.save_pretrained(interrupt_dir)
         torch.save(model.projector.state_dict(), os.path.join(interrupt_dir, "projector_weights.pth"))
-        with open(os.path.join(interrupt_dir, "checkpoint_meta.json"), "w", encoding="utf-8") as f:
-            json.dump({"global_step": global_step, "loss": last_loss_val, "saved_at_utc": _utc_now()}, f)
         return
 
-    except RuntimeError as e:
-        if "out of memory" in str(e).lower():
-            print(f"\nOOM at global_step={global_step}: {e}")
-        raise
-
-    final_dir = os.path.join(CHECKPOINT_DIR, "final")
+    final_dir = os.path.join(args.output_dir, "final")
     os.makedirs(final_dir, exist_ok=True)
     model.llm.save_pretrained(final_dir)
     torch.save(model.projector.state_dict(), os.path.join(final_dir, "projector_weights.pth"))

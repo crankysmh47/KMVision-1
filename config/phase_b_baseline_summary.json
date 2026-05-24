@@ -1,0 +1,13 @@
+{
+  "count": 12,
+  "json_valid_rate": 1.0,
+  "chart_type_accuracy": 1.0,
+  "mean_overall_score": 0.5381999999999999,
+  "mean_overall_score_valid_json": 0.5381999999999999,
+  "mean_text_score": 0.49360833333333326,
+  "mean_structure_score": 0.4097083333333334,
+  "mean_numeric_score": 0.5700666666666666,
+  "mean_censoring_score": 0.0,
+  "mean_coordinate_rmse": 0.31435707416705067,
+  "mean_fields_correct_ratio": 0.16685955067547428
+}

@@ -23,6 +23,7 @@ archives/
 dataset/
 train_1/
 testing/
+labels_compressed/
 
 # Real-world dataset artifacts
 real_dataset/images_km/
@@ -44,7 +45,7 @@ real_dataset/**/*.jpg
 **/images/**/*.jpg
 **/labels/**/*.json
 
-# Logs and runtime artifacts
+logs/
 *.log
 corrupted_images.log
 save_now.txt

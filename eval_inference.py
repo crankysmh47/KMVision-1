@@ -27,13 +27,47 @@ from evaluation.data_index import collect_all_valid_samples
 from evaluation.image_preprocess import pixel_values_from_path
 from evaluation.metrics import aggregate_scores, score_extraction
 from evaluation.parse_output import extract_json_from_text
-from evaluation.schema_compact import try_decompress_prediction
+from evaluation.schema_compact import decompress_chart
 from model import ClinicalMicroVLM
 
 DEFAULT_DATASET_ROOT = r"C:\sem4\KMVision-1 Data\dataset"
 DEFAULT_CHECKPOINT = "checkpoints/phase_b/final"
 EXTRACTION_PROMPT = "\nExtract the underlying data from this clinical chart in strict JSON format.\n"
 NUM_IMAGE_TOKENS = 3645
+
+
+def decompress_json(minified: dict) -> dict:
+    """
+    Expand Phase C minified keys back to verbose schema for metric calculators.
+
+    Handles KM t/s/c arrays (time_points, survival_probabilities, censoring_ticks)
+    and legacy compact keys via evaluation.schema_compact.decompress_chart.
+    """
+    if not isinstance(minified, dict):
+        raise TypeError("decompress_json expects a dict")
+
+    if minified.get("chart_type") in (None, "") and "ct" in minified:
+        expanded = decompress_chart(minified)
+    elif "chart_type" in minified:
+        return minified
+    else:
+        expanded = decompress_chart(minified)
+
+    # Normalize verbose KM arms if model used t/s/c at top level (non-compact ct format).
+    if expanded.get("chart_type") == "kaplan_meier":
+        arms = []
+        for arm in expanded.get("arms", []):
+            if "coordinates" not in arm and "t" in arm and "s" in arm:
+                arm = {
+                    "treatment_label": arm.get("treatment_label", arm.get("id", "")),
+                    "coordinates": [
+                        [float(t), float(s)] for t, s in zip(arm["t"], arm["s"])
+                    ],
+                    "censoring_ticks": arm.get("censoring_ticks", arm.get("c", [])),
+                }
+            arms.append(arm)
+        expanded["arms"] = arms
+    return expanded
 
 
 def resolve_checkpoint(path: str) -> str:
@@ -231,7 +265,10 @@ def main() -> None:
             err = str(e)
 
         try:
-            expanded = try_decompress_prediction(prediction_raw)
+            parsed, _ = extract_json_from_text(prediction_raw)
+            if parsed is None:
+                raise ValueError("could not parse prediction")
+            expanded = decompress_json(parsed)
             score = score_extraction(ground_truth, expanded)
         except (ValueError, TypeError, KeyError):
             score = score_extraction(ground_truth, prediction_raw)
@@ -261,6 +298,10 @@ def main() -> None:
         for rec in records:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
     with open(summary_path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2)
+
+    latest_path = os.path.join(args.output_dir, "latest_summary.json")
+    with open(latest_path, "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
 
     print("\n=== Evaluation summary ===")
