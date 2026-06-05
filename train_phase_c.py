@@ -1,18 +1,34 @@
 import argparse
-import os
-
-import torch
 import json
+import os
 import random
+import sys
 from datetime import datetime, timezone
-from torch.utils.data import Dataset, DataLoader
-from transformers import AutoProcessor, AutoTokenizer, get_linear_schedule_with_warmup, BitsAndBytesConfig
-from peft import PeftModel
-from tqdm import tqdm
-from PIL import Image
+
 import bitsandbytes as bnb
+import torch
+from peft import PeftModel
+from PIL import Image
+from torch.utils.data import Dataset, DataLoader
+from tqdm import tqdm
+from transformers import AutoProcessor, AutoTokenizer, BitsAndBytesConfig, get_linear_schedule_with_warmup
+
+ROOT = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, ROOT)
 
 from model import ClinicalMicroVLM
+from scripts.training_checkpoint import (
+    TRAINING_STATE_FILE,
+    load_latest_pointer,
+    load_training_state,
+    resolve_resume,
+    save_latest_pointer,
+    save_progress,
+    save_training_state,
+    step_dir_for,
+    verify_step_dir,
+)
+from scripts.training_lock import acquire_lock, release_lock
 from evaluation.schema_compact import (
     build_training_text,
     precompressed_fits_token_budget,
@@ -45,28 +61,55 @@ def _save_checkpoint(
     model,
     checkpoint_dir: str,
     global_step: int,
+    micro_step: int,
     loss_val: float,
+    optimizer,
+    scheduler,
+    args_dict: dict,
     *,
     folder_name: str | None = None,
 ) -> str:
-    step_dir = os.path.join(checkpoint_dir, folder_name or f"step_{global_step}")
+    if folder_name is not None:
+        step_dir = os.path.join(checkpoint_dir, folder_name)
+    else:
+        step_dir = step_dir_for(checkpoint_dir, global_step)
     os.makedirs(step_dir, exist_ok=True)
     model.llm.save_pretrained(step_dir)
     projector_path = os.path.join(step_dir, "projector_weights.pth")
     torch.save(model.projector.state_dict(), projector_path)
+    training_state_path = os.path.join(step_dir, TRAINING_STATE_FILE)
+    save_training_state(
+        training_state_path,
+        global_step=global_step,
+        micro_step=micro_step,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        last_loss=loss_val,
+        args_dict=args_dict,
+    )
     meta = {
         "global_step": global_step,
+        "micro_step": micro_step,
         "loss": loss_val,
         "saved_at_utc": _utc_now(),
         "adapter_dir": step_dir,
         "projector_weights": projector_path,
+        "training_state": training_state_path,
     }
     with open(os.path.join(step_dir, "checkpoint_meta.json"), "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)
-    if not os.path.isfile(projector_path) or not os.path.isfile(
-        os.path.join(step_dir, "adapter_model.safetensors")
-    ):
-        raise RuntimeError(f"Checkpoint incomplete at {step_dir}")
+    errors = verify_step_dir(step_dir)
+    if errors:
+        raise RuntimeError(f"Checkpoint incomplete at {step_dir}: {errors}")
+    save_latest_pointer(
+        checkpoint_dir,
+        global_step=global_step,
+        step_dir=step_dir,
+        micro_step=micro_step,
+        max_global_steps=int(args_dict.get("max_global_steps", 2000)),
+        has_training_state=True,
+        init_checkpoint=args_dict.get("init_checkpoint"),
+    )
     return step_dir
 
 
@@ -223,6 +266,7 @@ class CompactChartDataset(Dataset):
                 "input_ids": input_ids,
                 "attention_mask": attention_mask,
                 "labels": labels,
+                "is_classify": user_prompt == CLASSIFY_PROMPT,
             }
 
         raise RuntimeError(f"Too many consecutive corrupt samples near index {idx}.")
@@ -270,11 +314,34 @@ def parse_args():
     parser.add_argument("--max_global_steps", type=int, default=2000)
     parser.add_argument("--checkpoint_every", type=int, default=250)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--auto_resume",
+        action="store_true",
+        help="Resume from output_dir/latest.json or newest step_* if present.",
+    )
+    parser.add_argument(
+        "--no_auto_resume",
+        action="store_true",
+        help="Force a fresh run even if checkpoints exist in output_dir.",
+    )
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
+    try:
+        acquire_lock(pid=os.getpid(), label=f"train_phase_c {args.output_dir}")
+    except RuntimeError as exc:
+        print(f"FATAL: {exc}")
+        return
+
+    try:
+        _main_body(args)
+    finally:
+        release_lock(pid=os.getpid())
+
+
+def _main_body(args):
     image_dir = args.image_dir or os.path.join(args.dataset_root, "train_1", "images")
     label_dir = args.label_dir or os.path.join(args.dataset_root, "labels_compressed")
     os.makedirs(args.output_dir, exist_ok=True)
@@ -314,20 +381,31 @@ def main():
         bnb_4bit_quant_type="nf4",
     )
 
-    if not os.path.isdir(args.init_checkpoint):
-        print(f"FATAL: init checkpoint missing: {args.init_checkpoint}")
+    resume_info = None
+    if args.auto_resume and not args.no_auto_resume:
+        resume_info = resolve_resume(args.output_dir, args.init_checkpoint)
+        if resume_info:
+            print(
+                f"Auto-resume: global_step={resume_info['global_step']} "
+                f"micro_step={resume_info['micro_step']} "
+                f"from {resume_info['step_dir']}"
+            )
+
+    load_checkpoint = resume_info["step_dir"] if resume_info else args.init_checkpoint
+    if not os.path.isdir(load_checkpoint):
+        print(f"FATAL: checkpoint missing: {load_checkpoint}")
         return
 
-    print("Loading ClinicalMicroVLM + init adapter...")
+    print(f"Loading ClinicalMicroVLM + adapter from {load_checkpoint}...")
     model = ClinicalMicroVLM(bnb_config=bnb_config)
     model.vision_encoder.requires_grad_(False)
-    model.llm = PeftModel.from_pretrained(model.llm, args.init_checkpoint, is_trainable=True)
+    model.llm = PeftModel.from_pretrained(model.llm, load_checkpoint, is_trainable=True)
     model.llm.gradient_checkpointing_enable()
     model.llm.config.use_cache = False
     model.projector.requires_grad_(True)
     model.projector.load_state_dict(
         torch.load(
-            os.path.join(args.init_checkpoint, "projector_weights.pth"),
+            os.path.join(load_checkpoint, "projector_weights.pth"),
             map_location=device,
         )
     )
@@ -357,16 +435,45 @@ def main():
         num_training_steps=total_steps,
     )
 
-    print(f"\n--- Phase C: up to {args.max_global_steps} optimizer steps ---")
+    global_step = int(resume_info["global_step"]) if resume_info else 0
+    start_micro_step = int(resume_info["micro_step"]) if resume_info else 0
+    weights_step_dir = resume_info["step_dir"] if resume_info else load_checkpoint
+    if resume_info and resume_info.get("has_training_state"):
+        load_training_state(
+            resume_info["training_state_path"],
+            optimizer=optimizer,
+            scheduler=scheduler,
+            device=device,
+        )
+        print("Restored optimizer, scheduler, and RNG state.")
+    elif resume_info:
+        print("No training_state.pt found; resumed weights only (optimizer reset).")
+
+    if global_step >= args.max_global_steps:
+        print(f"Already at global_step={global_step} (target {args.max_global_steps}). Writing final/.")
+        final_dir = os.path.join(args.output_dir, "final")
+        os.makedirs(final_dir, exist_ok=True)
+        model.llm.save_pretrained(final_dir)
+        torch.save(model.projector.state_dict(), os.path.join(final_dir, "projector_weights.pth"))
+        return
+
+    args_dict = vars(args).copy()
+    args_dict["init_checkpoint"] = args.init_checkpoint
+
+    print(
+        f"\n--- Phase C: global_step {global_step} -> {args.max_global_steps} "
+        f"(micro_step skip {start_micro_step}) ---"
+    )
     model.train()
     torch.cuda.empty_cache()
     optimizer.zero_grad()
-    global_step = 0
     last_loss_val = 0.0
 
     try:
         progress_bar = tqdm(dataloader, desc="Phase C")
         for step, batch in enumerate(progress_bar):
+            if step < start_micro_step:
+                continue
             if global_step >= args.max_global_steps:
                 break
 
@@ -374,8 +481,11 @@ def main():
             input_ids = batch["input_ids"].to(device)
             attention_mask = batch["attention_mask"].to(device)
             labels = batch["labels"].to(device)
+            is_classify = batch.get("is_classify", False)
+            if torch.is_tensor(is_classify):
+                is_classify = bool(is_classify.reshape(-1)[0].item())
 
-            if step == 0:
+            if step == start_micro_step:
                 print(f"\n--- DIAGNOSTICS: seq_len={input_ids.shape[1]} + 3645 image tokens ---")
 
             outputs = model(
@@ -398,34 +508,83 @@ def main():
                 torch.cuda.empty_cache()
 
                 if global_step % args.checkpoint_every == 0:
-                    saved = _save_checkpoint(model, args.output_dir, global_step, loss_val)
-                    print(f"\n[Step {global_step}] Checkpoint saved -> {saved}")
+                    saved = _save_checkpoint(
+                        model,
+                        args.output_dir,
+                        global_step,
+                        step + 1,
+                        loss_val,
+                        optimizer,
+                        scheduler,
+                        args_dict,
+                    )
+                    weights_step_dir = saved
+                    print(f"\n[Step {global_step}] Checkpoint saved -> {saved}", flush=True)
 
                 if os.path.exists("save_now.txt"):
                     saved = _save_checkpoint(
                         model,
                         args.output_dir,
                         global_step,
+                        step + 1,
                         loss_val,
-                        folder_name=f"manual_step_{global_step}",
+                        optimizer,
+                        scheduler,
+                        args_dict,
+                        folder_name=f"manual_step_{global_step:06d}",
                     )
+                    weights_step_dir = saved
                     os.remove("save_now.txt")
-                    print(f"\n[TRIGGER] Manual checkpoint -> {saved}")
+                    print(f"\n[TRIGGER] Manual checkpoint -> {saved}", flush=True)
 
-            if step == 0:
+                task = "classify" if is_classify else "extract"
+                print(
+                    f"PROGRESS global_step={global_step}/{args.max_global_steps} "
+                    f"micro_step={step + 1} loss={loss_val:.4f} task={task}",
+                    flush=True,
+                )
+                save_progress(
+                    args.output_dir,
+                    global_step=global_step,
+                    micro_step=step + 1,
+                    weights_step_dir=weights_step_dir,
+                    max_global_steps=args.max_global_steps,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    last_loss=loss_val,
+                    args_dict=args_dict,
+                    init_checkpoint=args.init_checkpoint,
+                )
+
+            if step == start_micro_step:
                 mem = torch.cuda.max_memory_allocated() / 1024**3
                 print(f"--- DIAGNOSTICS: Max VRAM allocated {mem:.2f} GB ---")
 
             vram = torch.cuda.memory_reserved() / 1024**3
-            progress_bar.set_postfix({"loss": loss_val, "gstep": global_step, "vram": f"{vram:.1f}G"})
+            progress_bar.set_postfix(
+                {
+                    "loss": f"{loss_val:.3f}",
+                    "gstep": global_step,
+                    "vram": f"{vram:.1f}G",
+                    "task": "cls" if is_classify else "ext",
+                }
+            )
             del batch, pixel_values, input_ids, attention_mask, labels
 
     except KeyboardInterrupt:
         print("\nInterrupted — saving emergency checkpoint...")
-        interrupt_dir = os.path.join(args.output_dir, "interrupt_checkpoint")
-        os.makedirs(interrupt_dir, exist_ok=True)
-        model.llm.save_pretrained(interrupt_dir)
-        torch.save(model.projector.state_dict(), os.path.join(interrupt_dir, "projector_weights.pth"))
+        saved = _save_checkpoint(
+            model,
+            args.output_dir,
+            global_step,
+            step + 1 if "step" in locals() else start_micro_step,
+            last_loss_val,
+            optimizer,
+            scheduler,
+            args_dict,
+            folder_name=f"interrupt_step_{global_step:06d}",
+        )
+        print(f"Emergency checkpoint -> {saved}")
         return
 
     final_dir = os.path.join(args.output_dir, "final")
@@ -433,7 +592,25 @@ def main():
     model.llm.save_pretrained(final_dir)
     torch.save(model.projector.state_dict(), os.path.join(final_dir, "projector_weights.pth"))
     with open(os.path.join(final_dir, "checkpoint_meta.json"), "w", encoding="utf-8") as f:
-        json.dump({"global_step": global_step, "loss": last_loss_val, "saved_at_utc": _utc_now()}, f)
+        json.dump(
+            {
+                "global_step": global_step,
+                "micro_step": step + 1 if "step" in locals() else start_micro_step,
+                "loss": last_loss_val,
+                "saved_at_utc": _utc_now(),
+            },
+            f,
+            indent=2,
+        )
+    save_latest_pointer(
+        args.output_dir,
+        global_step=global_step,
+        step_dir=final_dir,
+        micro_step=0,
+        max_global_steps=args.max_global_steps,
+        has_training_state=False,
+        init_checkpoint=args.init_checkpoint,
+    )
     print(f"\nPhase C complete. Weights saved to {final_dir}")
 
 

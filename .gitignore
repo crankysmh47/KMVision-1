@@ -13,17 +13,30 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 
-# Model weights and checkpoints
+# Model weights and checkpoints (all phases, Stage 2, archives)
 checkpoints/
 archives/
 *.pth
+*.pt
 *.safetensors
+**/adapter_model.safetensors
+**/projector_weights.pth
+**/training_state.pt
+**/latest_training_state.pt
 
 # Dataset directories (in-repo copies or symlinks)
 dataset/
 train_1/
 testing/
 labels_compressed/
+stage2/
+stage2_holdout/
+stage2_v2/
+stage2_v2_holdout/
+
+# External dataset root lives outside repo by default:
+#   C:\sem4\KMVision-1 Data\dataset\
+# (train_1, testing, labels_compressed, stage2*, split_manifest.json)
 
 # Real-world dataset artifacts
 real_dataset/images_km/
@@ -50,10 +63,14 @@ logs/
 corrupted_images.log
 save_now.txt
 evaluation/results/
+logs/week_queue/training.lock
+training.lock
 
 # Hugging Face / model cache
 .cache/
 hub/
+**/.cache/huggingface/
+transformers_cache/
 
 # IDEs
 .vscode/

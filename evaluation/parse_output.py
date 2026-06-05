@@ -13,7 +13,9 @@ except ImportError:
 def repair_truncated_chart_json(text: str) -> str:
     """
     Fix outputs that begin mid-schema (common when decoding only new tokens).
-    Example: axes": { ...  ->  {"chart_type": "kaplan_meier", "axes": { ...
+
+    Verbose example: axes": { ...  ->  {"chart_type": "kaplan_meier", "axes": { ...
+    Minified KM example: Perm...","m":1.0},"y":...,"a":[...  -> prepend ct/ax header.
     """
     t = text.strip()
     if not t:
@@ -22,6 +24,9 @@ def repair_truncated_chart_json(text: str) -> str:
         return t
     if t.startswith('axes"') or t.startswith("axes"):
         return '{"chart_type": "kaplan_meier", "' + t
+    # Phase C minified KM: header {"ct":"km","ax":{"x":{"l":" was sliced off.
+    if re.search(r'"a"\s*:\s*\[', t) and re.search(r'"(p|id)"\s*:', t):
+        return '{"ct":"km","ax":{"x":{"l":"' + t
     return t
 
 
