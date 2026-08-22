@@ -34,7 +34,7 @@ from eval_stage2 import (
     parse_stage2_output_relaxed,
     sample_pairs,
 )
-from scripts.stitch_tiles import group_eval_jsonl_by_chart, stitch_chart_from_tiles
+from scripts.stitch_tiles import StitchError, group_eval_jsonl_by_chart, stitch_chart_from_tiles
 from transformers import AutoProcessor, AutoTokenizer
 
 DEFAULT_DATASET_ROOT = r"C:\sem4\KMVision-1 Data\dataset"
@@ -100,7 +100,11 @@ def score_stitched_chart(chart_stem: str, tile_records: List[dict], dataset_root
     if gt is None:
         return {"chart": chart_stem, "error": "missing_gt"}
 
-    stitched = stitch_chart_from_tiles(tile_records, chart_gt=gt)
+    try:
+        stitched = stitch_chart_from_tiles(tile_records, chart_gt=gt)
+    except StitchError as exc:
+        # Loud, explicit failure: never silently score a chart with dropped predictions.
+        return {"chart": chart_stem, "error": "stitch_failed", "detail": str(exc)}
     score = score_extraction(gt, stitched)
     return {
         "chart": chart_stem,
@@ -226,8 +230,11 @@ def main() -> int:
     from evaluation.metrics import ChartScore
 
     scores = [ChartScore(**r["score"]) for r in e2e_records if "score" in r and "error" not in r]
+    error_records = [r for r in e2e_records if "error" in r]
     summary = aggregate_scores(scores) if scores else {"count": 0}
     summary["eval_charts"] = len(e2e_records)
+    summary["scored_charts"] = len(scores)
+    summary["error_charts"] = len(error_records)
     summary["timestamp_utc"] = _utc_stamp()
     summary["stage2_jsonl"] = args.stage2_jsonl
     summary["macro_checkpoint"] = args.macro_checkpoint
@@ -262,6 +269,13 @@ def main() -> int:
             print(f"  {k}: {v}")
     print(f"\nPer-chart results: {jsonl_path}")
     print(f"Summary JSON:      {summary_path}")
+
+    if error_records:
+        print(f"\nE2E FAILURE: {len(error_records)} chart(s) failed to stitch and were NOT scored.")
+        for r in error_records:
+            print(f"  - {r['chart']}: {r.get('error')} :: {str(r.get('detail', ''))[:200]}")
+        print("Mean scores above exclude these charts. This run is incomplete.")
+        return 2
     return 0
 
 

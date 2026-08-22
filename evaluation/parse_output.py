@@ -2,7 +2,7 @@
 
 import json
 import re
-from typing import Any, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 try:
     import json_repair
@@ -16,6 +16,14 @@ _TRAILING_COMMA_RE = re.compile(r',(\s*])')
 _ORPHAN_INT_RE = re.compile(
     r'("(?:points|censors)"\s*:\s*\[\s*)(-?\d+)(\s*,\s*(?:0\.\d+|1(?:\.0+)?)\s*,)',
 )
+# Bare decimals the tokenizer emits without a leading zero: [.623, 0.015] or [0.1, .2]
+_BARE_DECIMAL_RE = re.compile(r'([\[,]\s*)\.(\d)')
+# Leading-zero integer literals (invalid JSON): [01, 0.218] or [007, ...]
+_LEADING_ZERO_INT_RE = re.compile(r'([\[,]\s*)0+(\d)(?![.\d])')
+# Stray empty string between comma and next key: ]," "censors":  ->  ],"censors":
+_STRAY_EMPTY_STRING_RE = re.compile(r',\s*"\s*"\s*"')
+# Restart pathology: model begins a second concatenated object {"arm_id": ...
+_ARM_ID_RE = re.compile(r'"arm_id"')
 
 
 def repair_stage2_json(text: str) -> str:
@@ -26,8 +34,13 @@ def repair_stage2_json(text: str) -> str:
     - Leading commas: "points": [, 0.299, ...]
     - Trailing commas before ]
     - Orphan integer at array start: "points": [9, 0.144, ...] (truncation artifact)
+    - Bare decimals: [.623, ...] -> [0.623, ...]
+    - Leading-zero integers: [01, ...] -> [1, ...]
+    - Stray string token between comma and key: ]," "censors": -> ],"censors":
+    - Restart pathology: model emits a second concatenated {"arm_id": ... object;
+      keep only the first object
     - Missing "censors" key when points array is present
-    - Truncated tail: close open arrays/object when braces are unbalanced
+    - Truncated/mismatched tails: repair bracket structure in LIFO order
     """
     t = text.strip()
     if not t:
@@ -39,6 +52,24 @@ def repair_stage2_json(text: str) -> str:
             t = "{" + t
         elif t.startswith("arm_id"):
             t = '{"' + t
+
+    # Restart pathology: keep only the first object when the model starts a
+    # second concatenated {"arm_id": ...} after finishing the first.
+    arm_id_positions = [m.start() for m in _ARM_ID_RE.finditer(t)]
+    if len(arm_id_positions) >= 2:
+        brace = t.rfind("{", 0, arm_id_positions[1])
+        if brace > 0:
+            t = t[:brace].rstrip().rstrip(",").rstrip()
+
+    # Stray blank string between a comma and the next (unquoted) key:
+    # ]," "censors": -> ],"censors":
+    # Normal ],"censors": is untouched (second quote position holds a letter).
+    t = re.sub(r',\s*"\s*"\s*(?=\w)', ',"', t)
+
+    # Normalize invalid numeric literals before comma/orphan repairs:
+    # bare decimals (.623 -> 0.623) and leading-zero integers (01 -> 1).
+    t = _BARE_DECIMAL_RE.sub(r"\g<1>0.\g<2>", t)
+    t = _LEADING_ZERO_INT_RE.sub(r"\g<1>\g<2>", t)
 
     # Normalize array comma artifacts inside points/censors lists.
     for _ in range(8):
@@ -64,10 +95,10 @@ def repair_stage2_json(text: str) -> str:
 
     t = _ORPHAN_INT_RE.sub(_drop_orphan, t)
 
-    # Close open arrays before adding missing keys or object braces.
-    open_brackets = t.count("[") - t.count("]")
-    if open_brackets > 0:
-        t += "]" * open_brackets
+    # Close any container still open at the correct nesting depth, then
+    # default missing keys. (Order matters: the old count-based repair
+    # appended "]" after a trailing "}", producing invalid JSON.)
+    t = _close_open_containers(t)
 
     # Default missing censors when points are present.
     if '"points"' in t and '"censors"' not in t:
@@ -76,10 +107,57 @@ def repair_stage2_json(text: str) -> str:
         else:
             t = t.rstrip().rstrip(",") + ', "censors": []}'
 
-    if t.count("{") > t.count("}"):
-        t += "}" * (t.count("{") - t.count("}"))
-
+    t = _close_open_containers(t)
     return t
+
+
+def _close_open_containers(text: str) -> str:
+    """Repair bracket/brace structure: fix mismatched closers, drop stray
+    closers, and append missing closers at the correct nesting depth.
+
+    String-aware single scan. Examples:
+      {"points": [0.1, 0.2}      -> {"points": [0.1, 0.2]}
+      {"points": [0.1, 0.2       -> {"points": [0.1, 0.2]}
+      {"censors": [0.9, 0.9]}    -> unchanged
+      {"points": [0.1]]}         -> {"points": [0.1]}  (stray "]" dropped)
+
+    A naive count-based repair appends "]" after a trailing "}", producing
+    invalid JSON; this one fixes closers in place and closes in LIFO order.
+    """
+    out: List[str] = []
+    stack: List[str] = []
+    in_string = False
+    escaped = False
+    for ch in text:
+        if escaped:
+            out.append(ch)
+            escaped = False
+            continue
+        if ch == "\\" and in_string:
+            out.append(ch)
+            escaped = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            out.append(ch)
+            continue
+        if in_string:
+            out.append(ch)
+            continue
+        if ch in "[{":
+            stack.append(ch)
+            out.append(ch)
+        elif ch in "]}":
+            if not stack:
+                continue  # stray extra closer at depth 0: drop it
+            expected = "]" if stack[-1] == "[" else "}"
+            out.append(expected)  # fix mismatched closer in place
+            stack.pop()
+        else:
+            out.append(ch)
+    for opener in reversed(stack):
+        out.append("]" if opener == "[" else "}")
+    return "".join(out)
 
 
 def normalize_stage2_dict(obj: dict) -> dict:

@@ -415,3 +415,66 @@ Status (2026-06-06): 128 curated KM images, 1129 unlabeled in queue, **0 labeled
 | train_1 tile regen | In progress → `stage2_train1/` |
 | Stage 2 @ 10k steps | In progress (resume from step 3000) |
 | Real-world | Infra ready; needs manual labeling |
+
+---
+
+### 11. Phase 0 — Stitcher repair: the first honest E2E numbers (2026-08-22)
+
+**Root cause found and fixed.** The 0.590 E2E number measured **no model
+output at all**. In `stitch_arm_tiles`, `prediction_raw` was parsed only
+inside the `if not meta:` branch — but `group_eval_jsonl_by_chart`
+pre-attaches `_meta` to every eval record, so the branch never ran and
+every arm was stitched with EMPTY coordinates. There was no macro fallback;
+predictions were silently *discarded*. Verified directly: feeding two
+different prediction streams produced byte-identical stitched output.
+That explains both the frozen 0.590 and the 0.000 censoring component.
+**The 0.590 figure is retired and must not be used as a baseline.**
+
+**Fixes (all under strict mode — failures are loud, never silent):**
+
+| File | Change |
+|------|--------|
+| `scripts/stitch_tiles.py` | Rewritten: unconditional prediction parsing (`prediction`/`parsed` dict or `prediction_raw` via repair parser); `StitchError` raised in strict mode on missing/unparseable/out-of-bounds predictions; provenance per tile (`prediction_source`, `tile_id`, counts) + chart-level `_meta.stitch` (version `stitch_v2_provenance_strict`); bounds assertions in normalized and clinical space; censors travel through the same inverse transform as points in their own list |
+| `eval_e2e.py` | Catches `StitchError` per chart → recorded as `stitch_failed` (never silently dropped); summary reports `scored_charts` / `error_charts`; exit code 2 if any chart failed to stitch |
+| `evaluation/parse_output.py` | New repairs, all verified by tests: bare decimals `.623`→`0.623`; leading-zero integers `01`→`1`; stray blank string `]," "censors":`→`],"censors":`; restart pathology (concatenated second `{"arm_id":…}` object truncated to the first); LIFO bracket repair `_close_open_containers` replacing the count-based closer that appended `]` after a trailing `}` |
+| `evaluation/test_stitch_tiles.py`, `evaluation/test_parse_output.py` | 25 tests total (was 10): regression tests for the silent-discard bug (different predictions must change output), strict-raise behavior, provenance, censor inverse transform, and every new parser repair |
+
+**Parser effect on existing eval JSONLs (no re-inference):**
+
+| JSONL | Unparseable before | After |
+|-------|-------------------:|------:|
+| Stage 2 3k (`eval_20260606T044115Z`) | 34 / 150 | **0 / 150** |
+| Stage 2 10k (`eval_20260607T012712Z`) | 15 / 150 | **0 / 150** |
+
+**First honest E2E numbers** (12 charts, same oracle tile boundaries;
+results in `evaluation/results/e2e_repaired_3k/` and `e2e_repaired_10k/`):
+
+| Metric | Broken 0.590 (retired) | 3k tiles | 10k tiles |
+|--------|------------------------|---------:|----------:|
+| Overall | 0.590 | **0.6127** | **0.6121** |
+| Numeric | 0.653 | 0.703 | 0.701 |
+| Structure | 0.382 | 0.382 | 0.382 |
+| Censoring | 0.000 | 0.026 | 0.028 |
+| RMSE | 0.391 | 0.270 | 0.278 |
+| Text | 0.608 | 0.608 | 0.608 |
+| Charts scored | 12/12* | 12/12 | 12/12 |
+
+\* the "broken" run scored 12/12 only because it scored the GT skeleton.
+
+**Interpretation (honest):**
+
+1. Predictions now genuinely contribute: numeric 0.653 → ~0.70, RMSE
+   0.391 → ~0.27, censoring 0.000 → 0.027 (nonzero at last).
+2. **3k ≈ 10k at the E2E level** (0.6127 vs 0.6121). The 10k tile-level
+   gains (strict JSON 77%→91%, censor F1 0.29→0.34) do **not** translate
+   to end-to-end improvement on these 12 charts. Structure (0.38) and
+   text (0.61) are inherited from the GT skeleton / arm naming and
+   dominate the residual gap.
+3. 12 charts remain statistically insufficient — this number has error
+   bars wider than the 3k-vs-10k difference. The 500+ chart validation
+   set (plan Phase 0 / §3.5) is the next prerequisite before any
+   Stage-2-vs-macro decision.
+4. Censoring is still ~0.03 end-to-end despite 0.34 tile-level F1 —
+   the remaining censor loss happens at stitch time (tile-level censors
+   are spatially sparse per tile and dedupe/aggregation discards most);
+   needs its own investigation, separate from the stitcher bug.
