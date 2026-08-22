@@ -32,15 +32,23 @@ from transformers import AutoProcessor, AutoTokenizer, BitsAndBytesConfig
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
-from evaluation.parse_output import extract_json_from_text
+from evaluation.parse_output import extract_json_from_text, extract_stage2_json
 from model import ClinicalMicroVLM
-from train_stage2 import NUM_IMAGE_TOKENS, stage2_user_prompt
+from stage2_common import (
+    as_point_tuples,
+    chat_prefix_for_user,
+    force_json_assistant_prefix,
+    stage2_user_prompt,
+)
+from train_stage2 import NUM_IMAGE_TOKENS
 
 DEFAULT_DATASET_ROOT = r"C:\sem4\KMVision-1 Data\dataset"
-DEFAULT_CHECKPOINT = "checkpoints/stage2_v2/final"
-DEFAULT_OUTPUT_DIR = "evaluation/results/stage2_v2_holdout"
+DEFAULT_CHECKPOINT = "checkpoints/stage2_v2_1/final"
+DEFAULT_OUTPUT_DIR = "evaluation/results/stage2_v2_1_holdout"
 POINT_TIME_MATCH_TOL = 0.5
+POINT_X_MATCH_TOL_NORMALIZED = 0.05
 CENSOR_TIME_TOL = 1.0
+CENSOR_X_TOL_NORMALIZED = 0.05
 
 
 def _utc_stamp() -> str:
@@ -50,6 +58,9 @@ def _utc_stamp() -> str:
 def resolve_checkpoint(path: str) -> str:
     if os.path.isdir(path):
         return path
+    alt = os.path.join("checkpoints/stage2_v2_1", path)
+    if os.path.isdir(alt):
+        return alt
     alt = os.path.join("checkpoints/stage2_v2", path)
     if os.path.isdir(alt):
         return alt
@@ -92,7 +103,7 @@ _PAIR_RE = re.compile(
 
 def parse_stage2_output(text: str, *, arm_id: str = "") -> Optional[dict]:
     """Strict JSON parse (expects full {"arm_id","points","censors"} object)."""
-    parsed, _ = extract_json_from_text(text)
+    parsed, _ = extract_stage2_json(text)
     if isinstance(parsed, dict) and ("points" in parsed or "censors" in parsed):
         return parsed
     return None
@@ -123,19 +134,22 @@ def parse_stage2_output_relaxed(text: str, *, arm_id: str = "") -> Optional[dict
 
 
 def _as_points(raw: Any) -> List[Tuple[float, float]]:
-    out: List[Tuple[float, float]] = []
-    if not isinstance(raw, list):
+    """Nested [[x,y],...] or flat [x,y,x,y,...] from model or label."""
+    if isinstance(raw, list) and raw and isinstance(raw[0], dict):
+        out: List[Tuple[float, float]] = []
+        for item in raw:
+            if isinstance(item, dict) and "t" in item and "s" in item:
+                out.append((float(item["t"]), float(item["s"])))
         return out
-    for item in raw:
-        if isinstance(item, (list, tuple)) and len(item) >= 2:
-            out.append((float(item[0]), float(item[1])))
-        elif isinstance(item, dict) and "t" in item and "s" in item:
-            out.append((float(item["t"]), float(item["s"])))
-    return out
+    return as_point_tuples(raw)
 
 
 def _censor_times(raw: Any) -> List[float]:
     return sorted(t for t, _ in _as_points(raw))
+
+
+def _label_coordinate_space(label_obj: dict) -> str:
+    return str(label_obj.get("_meta", {}).get("coordinate_space", "clinical"))
 
 
 def match_points(
@@ -143,6 +157,7 @@ def match_points(
     pred: Sequence[Tuple[float, float]],
     *,
     time_tol: float = POINT_TIME_MATCH_TOL,
+    normalized_space: bool = False,
 ) -> Tuple[List[float], int, int]:
     if not gt:
         return [], 0, 0
@@ -150,17 +165,20 @@ def match_points(
     sq_errors: List[float] = []
     matched = 0
 
-    for gt_t, gt_s in gt:
+    for gt_a, gt_b in gt:
         best_j = -1
-        best_dt = time_tol + 1.0
-        for j, (p_t, p_s) in enumerate(pred_remaining):
-            dt = abs(p_t - gt_t)
-            if dt <= time_tol and dt < best_dt:
-                best_dt = dt
+        best_da = time_tol + 1.0
+        for j, (p_a, p_b) in enumerate(pred_remaining):
+            da = abs(p_a - gt_a)
+            if da <= time_tol and da < best_da:
+                best_da = da
                 best_j = j
         if best_j >= 0:
-            _p_t, p_s = pred_remaining.pop(best_j)
-            sq_errors.append((p_s - gt_s) ** 2)
+            p_a, p_b = pred_remaining.pop(best_j)
+            if normalized_space:
+                sq_errors.append((p_a - gt_a) ** 2 + (p_b - gt_b) ** 2)
+            else:
+                sq_errors.append((p_b - gt_b) ** 2)
             matched += 1
 
     return sq_errors, matched, len(gt)
@@ -169,8 +187,13 @@ def match_points(
 def coordinate_rmse(
     gt: Sequence[Tuple[float, float]],
     pred: Sequence[Tuple[float, float]],
+    *,
+    time_tol: float = POINT_TIME_MATCH_TOL,
+    normalized_space: bool = False,
 ) -> Tuple[Optional[float], int, int]:
-    sq, matched, n_gt = match_points(gt, pred)
+    sq, matched, n_gt = match_points(
+        gt, pred, time_tol=time_tol, normalized_space=normalized_space
+    )
     if matched == 0:
         return None, 0, n_gt
     return math.sqrt(sum(sq) / len(sq)), matched, n_gt
@@ -240,6 +263,7 @@ def generate_tile_json(
     device: torch.device,
     *,
     max_new_tokens: int = 384,
+    force_json_prefix: bool = False,
 ) -> str:
     image = Image.open(image_path).convert("RGB")
     if image.size != (384, 384):
@@ -247,15 +271,11 @@ def generate_tile_json(
     pixel_values = processor(images=[image], return_tensors="pt").pixel_values
 
     user_prompt = stage2_user_prompt(arm_id)
-    try:
-        messages = [{"role": "user", "content": user_prompt.strip()}]
-        prefix = tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
-    except Exception:
-        prefix = f"<|im_start|>user\n{user_prompt.strip()}\n\n<|im_start|>assistant\n"
+    chat_prefix = chat_prefix_for_user(user_prompt, tokenizer)
+    assistant_forced = force_json_assistant_prefix(arm_id) if force_json_prefix else ""
+    full_prefix = chat_prefix + assistant_forced
 
-    encoded = tokenizer(prefix, return_tensors="pt", add_special_tokens=True)
+    encoded = tokenizer(full_prefix, return_tensors="pt", add_special_tokens=True)
     input_ids = encoded.input_ids
     inputs_embeds, attention_mask = build_inputs_embeds(model, pixel_values, input_ids, device)
 
@@ -273,7 +293,10 @@ def generate_tile_json(
     else:
         new_ids = output_ids
 
-    return tokenizer.decode(new_ids[0], skip_special_tokens=True).strip()
+    continuation = tokenizer.decode(new_ids[0], skip_special_tokens=True).strip()
+    if force_json_prefix:
+        return assistant_forced + continuation
+    return continuation
 
 
 def load_model(checkpoint_dir: str, device: torch.device) -> ClinicalMicroVLM:
@@ -352,6 +375,7 @@ def run_evaluation(
     device: torch.device,
     *,
     max_new_tokens: int,
+    force_json_prefix: bool = False,
 ) -> List[dict]:
     records: List[dict] = []
 
@@ -359,6 +383,9 @@ def run_evaluation(
         with open(label_path, encoding="utf-8") as f:
             gt = json.load(f)
         arm_id = gt.get("arm_id", "unknown")
+        normalized_space = _label_coordinate_space(gt) == "normalized_local"
+        match_tol = POINT_X_MATCH_TOL_NORMALIZED if normalized_space else POINT_TIME_MATCH_TOL
+        censor_tol = CENSOR_X_TOL_NORMALIZED if normalized_space else CENSOR_TIME_TOL
         gt_points = _as_points(gt.get("points", []))
         gt_censors = _censor_times(gt.get("censors", []))
 
@@ -366,14 +393,17 @@ def run_evaluation(
             "image": str(img_path),
             "label": str(label_path),
             "arm_id": arm_id,
+            "coordinate_space": _label_coordinate_space(gt),
             "n_gt_points": len(gt_points),
             "n_gt_censors": len(gt_censors),
+            "force_json_prefix": force_json_prefix,
         }
 
         try:
             raw = generate_tile_json(
                 model, processor, tokenizer, img_path, arm_id, device,
                 max_new_tokens=max_new_tokens,
+                force_json_prefix=force_json_prefix,
             )
             rec["inference_error"] = None
         except Exception as exc:
@@ -408,16 +438,23 @@ def run_evaluation(
         rec["n_pred_points"] = len(pred_points)
         rec["n_pred_censors"] = len(pred_censors)
 
-        rmse, matched, n_gt = coordinate_rmse(gt_points, pred_points)
+        rmse, matched, n_gt = coordinate_rmse(
+            gt_points, pred_points, time_tol=match_tol, normalized_space=normalized_space
+        )
         sq_sum = 0.0
         if matched:
-            sq, _, _ = match_points(gt_points, pred_points)
+            sq, _, _ = match_points(
+                gt_points,
+                pred_points,
+                time_tol=match_tol,
+                normalized_space=normalized_space,
+            )
             sq_sum = sum(sq)
         rec["coordinate_rmse"] = round(rmse, 6) if rmse is not None else None
         rec["points_matched"] = matched
         rec["points_sq_error_sum"] = sq_sum
 
-        p, r, f1, tp, fp, fn = set_prf1(gt_censors, pred_censors, tol=CENSOR_TIME_TOL)
+        p, r, f1, tp, fp, fn = set_prf1(gt_censors, pred_censors, tol=censor_tol)
         rec.update(
             {
                 "censoring_precision": round(p, 4),
@@ -458,6 +495,11 @@ def parse_args():
         help="Generation cap (tile labels are often 800+ tokens).",
     )
     p.add_argument(
+        "--force-json-prefix",
+        action="store_true",
+        help='Pre-fill assistant with {"arm_id": "<id>", "points": [ before generation.',
+    )
+    p.add_argument(
         "--rescore-only",
         type=str,
         default=None,
@@ -480,6 +522,9 @@ def rescore_jsonl(jsonl_path: Path, *, checkpoint: str) -> dict:
             gt = json.load(f)
         gt_points = _as_points(gt.get("points", []))
         gt_censors = _censor_times(gt.get("censors", []))
+        normalized_space = _label_coordinate_space(gt) == "normalized_local"
+        match_tol = POINT_X_MATCH_TOL_NORMALIZED if normalized_space else POINT_TIME_MATCH_TOL
+        censor_tol = CENSOR_X_TOL_NORMALIZED if normalized_space else CENSOR_TIME_TOL
         pred_strict = parse_stage2_output(raw)
         pred = parse_stage2_output_relaxed(raw, arm_id=arm_id)
         if pred is None:
@@ -495,12 +540,19 @@ def rescore_jsonl(jsonl_path: Path, *, checkpoint: str) -> dict:
             continue
         pred_points = _as_points(pred.get("points", []))
         pred_censors = _censor_times(pred.get("censors", []))
-        rmse, matched, _ = coordinate_rmse(gt_points, pred_points)
+        rmse, matched, _ = coordinate_rmse(
+            gt_points, pred_points, time_tol=match_tol, normalized_space=normalized_space
+        )
         sq_sum = 0.0
         if matched:
-            sq, _, _ = match_points(gt_points, pred_points)
+            sq, _, _ = match_points(
+                gt_points,
+                pred_points,
+                time_tol=match_tol,
+                normalized_space=normalized_space,
+            )
             sq_sum = sum(sq)
-        p, r, f1, tp, fp, fn = set_prf1(gt_censors, pred_censors, tol=CENSOR_TIME_TOL)
+        p, r, f1, tp, fp, fn = set_prf1(gt_censors, pred_censors, tol=censor_tol)
         rec.update(
             json_valid=True,
             json_valid_strict=pred_strict is not None,
@@ -551,7 +603,7 @@ def main() -> int:
         return 0
 
     root = Path(args.dataset_root)
-    holdout = Path(args.holdout_dir or root / "stage2_v2_holdout")
+    holdout = Path(args.holdout_dir or root / "stage2_v2_1_holdout")
     image_dir = Path(args.image_dir or holdout / "images" / "km")
     label_dir = Path(args.label_dir or holdout / "labels" / "km")
 
@@ -569,6 +621,8 @@ def main() -> int:
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}  |  Checkpoint: {checkpoint_dir}")
     print(f"Evaluating {len(pairs)} / {len(all_pairs)} holdout tiles from {holdout}")
+    if args.force_json_prefix:
+        print("  force_json_prefix: ON (assistant pre-filled through points array open)")
 
     processor = AutoProcessor.from_pretrained(
         "google/siglip2-so400m-patch14-384", trust_remote_code=True
@@ -581,7 +635,13 @@ def main() -> int:
 
     model = load_model(checkpoint_dir, device)
     records = run_evaluation(
-        model, processor, tokenizer, pairs, device, max_new_tokens=args.max_new_tokens
+        model,
+        processor,
+        tokenizer,
+        pairs,
+        device,
+        max_new_tokens=args.max_new_tokens,
+        force_json_prefix=args.force_json_prefix,
     )
 
     stamp = _utc_stamp()
@@ -591,6 +651,7 @@ def main() -> int:
     summary["eval_samples"] = len(pairs)
     summary["holdout_pool_size"] = len(all_pairs)
     summary["seed"] = args.seed
+    summary["force_json_prefix"] = args.force_json_prefix
     summary["timestamp_utc"] = stamp
 
     out_dir = Path(args.output_dir)

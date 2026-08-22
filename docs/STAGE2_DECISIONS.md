@@ -70,7 +70,7 @@ Implementation files: `scripts/generate_stage2_tiles.py`, `train_stage2.py`, `ev
 
 **Volume:** Default `--max_charts 12000` from ~238k unused KM testing charts.
 
-**Holdout:** `--holdout_fraction` (default 0.05) writes to `dataset/stage2_holdout/` for `eval_stage2.py`; remainder to `dataset/stage2/`.
+**Holdout:** `--holdout_fraction` (default 0.05) writes to `dataset/stage2_holdout/` for `eval_stage2.py`; remainder to `dataset/stage2/`. (v2.1 uses `stage2_v2_1_holdout/`.)
 
 ---
 
@@ -114,9 +114,92 @@ Implementation files: `scripts/generate_stage2_tiles.py`, `train_stage2.py`, `ev
 
 ---
 
-## 9. Explicit non-goals (MVP)
+## 10. Stage 2 v2.1 — normalized local coordinate space
+
+**Problem (v2 clinical labels):** A 384×384 crop has no visible axes. Asking the model to emit global `(time, survival)` from pixels alone is ill-posed. The ~3% point match on v2 was largely curve memorization, not measurement.
+
+**Problem (bracket chaos / tokenizer entropy):** High-entropy floats like `60.3207` split into many subword tokens (e.g. Qwen: `[60]`, `[.]`, `[32]`, `[07]`). With ~40 coordinate pairs, the autoregressive stream is dominated by arbitrary digit subwords; the model loses track of JSON syntax (`[`, `,`, `]`) and emits malformed pairs like `[11, 0.422979)`. Prefix forcing (§8 in `Update.md`) raised strict JSON from 0% → 47% without retraining — proving routing failure, not vision — but bracket chaos persists on the remaining failures until coordinates are simplified.
+
+**Decision:** Train and eval in **normalized local tile space**:
+
+| Corner | Normalized `[x, y]` |
+|--------|---------------------|
+| Top-left of tile | `[0.000, 0.000]` |
+| Bottom-right of tile | `[1.000, 1.000]` |
+
+All coordinates rounded to **3 decimal places** (`0.000`–`1.000`).
+
+**Label pipeline (`generate_stage2_tiles.py`):**
+
+1. **Clinical → global pixel** on 768×768 canvas:  
+   `px = plot.x0 + (t / x_max) * plot.width`  
+   `py = plot.y1 - (s / y_max) * plot.height`
+2. **Global pixel → local tile pixel:**  
+   `x_local = px - tile.x0`, `y_local = py - tile.y0`
+3. **Local → normalized:**  
+   `x_norm = round(x_local / 384, 3)`, same for y (image y down)
+
+Step-aware KM subsampling runs in **clinical space before** conversion (preserves step corners).
+
+**Middleware (production handoff):** `scripts/stage2_coordinate_transform.py` inverts normalized → clinical using `_meta.tile_origin`, `_meta.plot_bbox`, `_meta.axis_max`.
+
+**Training (`train_stage2.py` v2.1):**
+
+- Data: `dataset/stage2_v2_1/`, checkpoint: `checkpoints/stage2_v2_1/`
+- Prompt mentions normalized `[x,y]` in `[0,1]` (`stage2_common.py`)
+- **Prefix-masked loss:** mask user ChatML + forced prefix `{"arm_id": "<id>", "points": [`; loss only on coordinate stream + closing JSON
+- Fresh LoRA + Phase A projector; `max_length=1024`
+
+**Inference (`eval_stage2.py`):**
+
+- Use `--force-json-prefix` (pre-fill through `"points": [`)
+- Compare predictions to normalized labels directly (RMSE in tile space)
+
+**Paths:**
+
+| Artifact | Location |
+|----------|----------|
+| Train tiles | `{dataset}/stage2_v2_1/` |
+| Holdout | `{dataset}/stage2_v2_1_holdout/` |
+| Weights | `checkpoints/stage2_v2_1/final` |
+
+**Orchestration:** `run_stage2_v2_1_sanity.bat` (regen → 500-step train → prefix sanity check)
+
+**Benefits (three-way fix):**
+
+1. **Vision accuracy** — SigLIP sees a tick at tile center and predicts `0.500`; no global clinical guess from an axisless crop.
+2. **Syntax stability** — `0.500` is a short, predictable token pattern; bracket/comma rhythm stays intact.
+3. **Token budget** — 3-decimal normalized coords use fewer subwords; 40 points + 10 censors fit in `max_length=1024`.
+
+---
+
+## 11. Stage 2 v2.2 — flat interleaved coordinates (syntax fix)
+
+**Problem (v2.1 nested JSON):** Even with normalized 3-decimal values, training target used nested `"points": [[x,y], [x,y], ...]`. The model opened `"points": [` then emitted sibling arrays — bracket chaos like `[.10], [0.145, 0.112]` (20% strict JSON after 500 steps).
+
+**Root cause:** Each point requires an inner `[` `]` pair inside the outer array. The autoregressive model loses nesting depth after ~40 pairs.
+
+**Decision:** Flat interleaved lists — no nested coordinate arrays:
+
+```json
+{"arm_id": "Drug X", "points": [0.145, 0.112, 0.146, 0.124], "censors": [0.01, 0.652]}
+```
+
+| Aspect | Detail |
+|--------|--------|
+| Training target | `stage2_common.stage2_target_json()` flattens disk labels at load time |
+| Disk labels | Unchanged nested `[[x,y],...]` in `stage2_v2_1/` (no regen) |
+| Prefix | Still `{"arm_id": "<id>", "points": [` — next tokens are plain numbers |
+| Eval | `_as_points()` / `coords_to_pairs()` accept nested or flat |
+| Checkpoint | Same path `checkpoints/stage2_v2_1/` — **fresh train** after format change |
+
+**Orchestration:** `run_stage2_v2_2_overnight.bat` (500 sanity → gate → 3000 train → 150-tile eval)
+
+---
+
+## 12. Explicit non-goals (MVP)
 
 - No Stage 1 inference in the generator (uses dense GT for bbox calibration quality on synthetic data).
 - No path-guided windows from Run 2 predictions yet.
 - No multi-GPU / queue integration.
-- Scripts are **write-only** in this PR — user requested no execution.
+- End-to-end 2-pass eval (Run 2 macro → crop → Stage 2) not built yet.

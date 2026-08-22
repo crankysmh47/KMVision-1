@@ -91,19 +91,16 @@ Targets: 250 KM, 125 forest, 125 waterfall (`real_dataset/config.py`).
 
 Intermediate Phase B checkpoints exist at steps 250 through 6250 (every 250 steps).
 
-### Stage 2 (Sniper tiles)
+### Stage 2 (Sniper tiles) — v2.2 flat normalized coordinates
 
-1. Generate tiles: `python scripts/generate_stage2_tiles.py --max_charts 12000` (v2 defaults: `stage2_v2/`, 40 pts / 10 censors cap)
-2. Train: `python train_stage2.py` (v2 default: 500-step sanity, `checkpoints/stage2_v2/`, fresh init)
-3. Sanity: `python scripts/stage2_sanity_check.py --checkpoint checkpoints/stage2_v2/final`
-4. Full train (after sanity passes): `python train_stage2.py --max_global_steps 3000`
-5. Evaluate: `python eval_stage2.py --checkpoint checkpoints/stage2_v2/final`
+1. Tiles (once): `python scripts/generate_stage2_tiles.py --max_charts 12000` → `stage2_v2_1/`
+2. Overnight: `run_stage2_v2_2_overnight.bat` (500 sanity → 3000 train → eval if sanity passes)
+3. Manual sanity: `python scripts/stage2_sanity_check.py --checkpoint checkpoints/stage2_v2_1/final --force-json-prefix`
+4. Manual eval: `python eval_stage2.py --checkpoint checkpoints/stage2_v2_1/final --force-json-prefix`
 
-Or run the full v2 pipeline: `run_stage2_v2_sanity.bat`
+Training targets use **flat** `"points": [x1,y1,x2,y2,...]` (no nested `[x,y]` arrays). Design: `docs/STAGE2_DECISIONS.md` §10–11.
 
-Unattended full train (resume 500→3000) + eval: `run_stage2_v2_full.bat` — logs to `logs/stage2_v2_full_*.log`, results in `evaluation/results/stage2_v2_holdout/`.
-
-Holdout tiles live in `{dataset_root}/stage2_v2_holdout/`. v1 artifacts remain in `stage2/` and `checkpoints/stage2/` for comparison.
+Legacy v1/v2 clinical tiles: `stage2/`, `stage2_v2/` (gitignored on disk under external dataset root).
 
 ## Evaluation
 
@@ -113,7 +110,7 @@ Holdout tiles live in `{dataset_root}/stage2_v2_holdout/`. v1 artifacts remain i
 python eval_inference.py
 python eval_inference.py --max-samples 50 --category km
 python eval_inference.py --checkpoint checkpoints/phase_b/final
-python eval_stage2.py --max-samples 150 --seed 0
+python eval_stage2.py --max-samples 150 --seed 0 --force-json-prefix
 ```
 
 **Metrics (`evaluation/metrics.py`):**
@@ -131,7 +128,8 @@ Unit tests: `python -m pytest evaluation/test_metrics.py` (or `python evaluation
 model.py                  # ClinicalMicroVLM architecture
 train_phase_a.py          # Phase A projector training
 train_phase_b.py          # Phase B QLoRA training
-eval_inference.py         # Holdout evaluation
+eval_stage2.py         # Stage 2 tile holdout evaluation
+stage2_common.py       # Shared Stage 2 prompt + JSON prefix helpers
 evaluation/               # Metrics, parsing, data indexing, preprocessing
 synth_dataset/            # Synthetic chart generation
 real_dataset/             # PMC scraping, extraction, labeling

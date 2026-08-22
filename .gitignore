@@ -33,6 +33,10 @@ stage2/
 stage2_holdout/
 stage2_v2/
 stage2_v2_holdout/
+stage2_v2_1/
+stage2_v2_1_holdout/
+stage2_train1/
+stage2_train1_holdout/
 
 # External dataset root lives outside repo by default:
 #   C:\sem4\KMVision-1 Data\dataset\

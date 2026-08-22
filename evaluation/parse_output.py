@@ -9,6 +9,106 @@ try:
 except ImportError:
     json_repair = None  # type: ignore
 
+# Stage 2 flat coordinate arrays: "points": [x1, y1, ...], "censors": [x1, y1, ...]
+_ARRAY_FIELD_RE = re.compile(r'"(points|censors)"\s*:\s*\[')
+_LEADING_COMMA_RE = re.compile(r'(\[\s*),(\s*[-\d.])')
+_TRAILING_COMMA_RE = re.compile(r',(\s*])')
+_ORPHAN_INT_RE = re.compile(
+    r'("(?:points|censors)"\s*:\s*\[\s*)(-?\d+)(\s*,\s*(?:0\.\d+|1(?:\.0+)?)\s*,)',
+)
+
+
+def repair_stage2_json(text: str) -> str:
+    """
+    Fix common Stage 2 flat_xy malformations before strict JSON parsing.
+
+    Handles:
+    - Leading commas: "points": [, 0.299, ...]
+    - Trailing commas before ]
+    - Orphan integer at array start: "points": [9, 0.144, ...] (truncation artifact)
+    - Missing "censors" key when points array is present
+    - Truncated tail: close open arrays/object when braces are unbalanced
+    """
+    t = text.strip()
+    if not t:
+        return t
+
+    # Ensure object wrapper when prefix-forced generation starts mid-stream.
+    if not t.startswith("{"):
+        if '"points"' in t or t.startswith('"arm_id"'):
+            t = "{" + t
+        elif t.startswith("arm_id"):
+            t = '{"' + t
+
+    # Normalize array comma artifacts inside points/censors lists.
+    for _ in range(8):
+        prev = t
+        t = _LEADING_COMMA_RE.sub(r"\1\2", t)
+        t = _TRAILING_COMMA_RE.sub(r"\1", t)
+        if t == prev:
+            break
+
+    # Drop orphan leading integer when followed by normalized float pairs.
+    def _drop_orphan(match: re.Match[str]) -> str:
+        prefix, orphan, rest = match.group(1), match.group(2), match.group(3)
+        try:
+            val = int(orphan)
+        except ValueError:
+            return match.group(0)
+        # Keep 0/1 when they are valid normalized coordinates.
+        if val in (0, 1):
+            return match.group(0)
+        if abs(val) >= 2:
+            return prefix + rest.lstrip(", ")
+        return match.group(0)
+
+    t = _ORPHAN_INT_RE.sub(_drop_orphan, t)
+
+    # Close open arrays before adding missing keys or object braces.
+    open_brackets = t.count("[") - t.count("]")
+    if open_brackets > 0:
+        t += "]" * open_brackets
+
+    # Default missing censors when points are present.
+    if '"points"' in t and '"censors"' not in t:
+        if t.rstrip().endswith("}"):
+            t = t.rstrip()[:-1].rstrip().rstrip(",") + ', "censors": []}'
+        else:
+            t = t.rstrip().rstrip(",") + ', "censors": []}'
+
+    if t.count("{") > t.count("}"):
+        t += "}" * (t.count("{") - t.count("}"))
+
+    return t
+
+
+def normalize_stage2_dict(obj: dict) -> dict:
+    """Ensure arm_id/points/censors keys with list values after parse."""
+    out = dict(obj)
+    if "points" not in out:
+        out["points"] = []
+    if "censors" not in out:
+        out["censors"] = []
+    if not isinstance(out.get("points"), list):
+        out["points"] = []
+    if not isinstance(out.get("censors"), list):
+        out["censors"] = []
+    return out
+
+
+def extract_stage2_json(text: str) -> Tuple[Optional[dict], Optional[str]]:
+    """
+    Parse Stage 2 tile output {"arm_id", "points", "censors"} with repair heuristics.
+    """
+    if not text or not text.strip():
+        return None, "empty output"
+
+    cleaned = repair_stage2_json(text.strip())
+    parsed, err = extract_json_from_text(cleaned)
+    if isinstance(parsed, dict) and ("points" in parsed or "censors" in parsed or "arm_id" in parsed):
+        return normalize_stage2_dict(parsed), None
+    return parsed, err
+
 
 def repair_truncated_chart_json(text: str) -> str:
     """
@@ -41,6 +141,8 @@ def extract_json_from_text(text: str) -> Tuple[Optional[dict], Optional[str]]:
         return None, "empty output"
 
     cleaned = repair_truncated_chart_json(text.strip())
+    if '"points"' in cleaned or '"censors"' in cleaned:
+        cleaned = repair_stage2_json(cleaned)
 
     # Strip ```json ... ``` or ``` ... ``` fences
     fence_match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", cleaned, re.IGNORECASE)

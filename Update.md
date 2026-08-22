@@ -196,3 +196,222 @@ Slight improvement vs v1 (~2.1% point match) but still no valid JSON envelope or
 ### 7. Git / commit readiness
 
 Repo code and docs are ready to commit; large artifacts are gitignored (`.gitignore` updated for checkpoints, `*.pt`, tile dataset dir names, `evaluation/results/`, `logs/`, HF cache). Run `git status` and commit when ready — no auto-commit from agent runs.
+
+---
+
+### 8. Prefix forcing experiment + Stage 2 v2.1 (normalized local space)
+
+**Prefix forcing (`--force-json-prefix` in `eval_stage2.py`, `scripts/stage2_sanity_check.py`)**
+
+Inference pre-fills the assistant through `{"arm_id": "<id>", "points": [` before generation. No weight changes.
+
+| Condition | Strict JSON (15 tiles) |
+|-----------|------------------------|
+| No prefix | 0% |
+| With prefix | **47%** (7/15) |
+
+This is a major diagnostic win: **0% → 47% without changing a single weight** proves the model *can* speak JSON when anchored, and that the text-routing engine was failing to initialize from a blank assistant — not a vision failure.
+
+Remaining failures show **bracket chaos**: malformed pairs like `[11, 0.422979)` mixing `[` and `(`, or losing comma/bracket rhythm mid-stream.
+
+**Root cause — tokenizer entropy on clinical floats**
+
+Language models struggle with arbitrary floating-point numbers. A value like `60.3207` is not one token; the Qwen tokenizer may split it into `[60]`, `[.]`, `[32]`, `[07]`. When the model must emit ~40 coordinate pairs of these high-entropy, multi-token floats, the autoregressive engine loses syntax context — it forgets whether it just opened `[` or needs `,` because attention is dominated by random digit subwords.
+
+**Shared code:** `stage2_common.py` — prompt, `force_json_assistant_prefix()`, `mask_len_through_json_prefix()`.
+
+**Training alignment (v2.1):** `train_stage2.py` keeps the full JSON (including `{"arm_id": "...", "points": [`) in the training sequence but **masks loss** on user ChatML + that forced prefix; the model only learns the coordinate stream + closing `], "censors": [...]}`. Eval always uses `--force-json-prefix` to match.
+
+**Stage 2 v2.1 — normalized local labels**
+
+| Change | Detail |
+|--------|--------|
+| Coordinate system | `[x_norm, y_norm]` in `[0.000, 1.000]` per 384×384 tile (3 decimals), not clinical time/survival |
+| Generator | `scripts/generate_stage2_tiles.py` — 3-step transform below; step-aware cap in **clinical space first** |
+| Middleware | `scripts/stage2_coordinate_transform.py` — inverse normalized → clinical using `_meta` |
+| Data paths | `stage2_v2_1/`, `stage2_v2_1_holdout/` |
+| Checkpoints | `checkpoints/stage2_v2_1/` (fresh LoRA; **do not** resume `stage2_v2/`) |
+| Eval | `--force-json-prefix`; x-tolerance 0.05 + 2D RMSE in tile space for normalized labels |
+| Orchestration | `run_stage2_v2_1_sanity.bat` |
+
+**Label transform pipeline (`generate_stage2_tiles.py`)**
+
+1. **Clinical → global pixel** on 768×768 canvas (matplotlib axes metadata):  
+   `px = plot.x0 + (t / x_max) * plot.width`, `py = plot.y1 - (s / y_max) * plot.height`
+2. **Global pixel → local tile pixel:**  
+   `x_local = px - tile.x0`, `y_local = py - tile.y0`
+3. **Local tile pixel → normalized:**  
+   `x_norm = round(x_local / 384, 3)` (clamped to `[0, 1]`); same for y. Image y increases downward.
+
+Corner semantics: `[0.000, 0.000]` = top-left of crop; `[1.000, 1.000]` = bottom-right.
+
+Each label stores `_meta.coordinate_space = "normalized_local"`, `tile_origin`, `plot_bbox`, `axis_max` for middleware inverse.
+
+**Why v2.1 fixes both accuracy and formatting**
+
+| Problem | Fix |
+|---------|-----|
+| Vision (clinical coords on axisless crop) | Model predicts position *within the tile* — tick at horizontal center → `0.500` |
+| Bracket chaos (high-entropy floats) | Short 3-decimal tokens like `0.500` are low-entropy and rhythmic for the tokenizer |
+| Token budget (`max_length=1024`) | Fewer subwords per coordinate → full 40-point + 10-censor JSON fits comfortably |
+
+Full design: `docs/STAGE2_DECISIONS.md` §10.
+
+**Status (2026-06-05 run):**
+
+| Step | Result |
+|------|--------|
+| Tile regen | **Done** — 71,451 train tiles → `stage2_v2_1/` |
+| Bugfix | `mask_len_through_json_prefix` — Coder tokenizer returns flat `input_ids`; fixed via `_encode_token_len()` |
+| 500-step train | **Done** — loss 0.4827 @ step 500 → `checkpoints/stage2_v2_1/final` (~76 min) |
+| Prefix sanity (10 tiles) | **FAILED** — 2/10 strict JSON (20%); normalized coords visible but flat `[x,y], [x,y]` bracket chaos persists |
+
+Log: `logs/stage2_v2_1_train_sanity_20260605_233242.log`
+
+---
+
+### 9. Stage 2 v2.2 — flat interleaved coordinates + overnight run
+
+**Diagnosis:** v2.1 nested `[[x,y],...]` still caused bracket chaos (`[.10], [0.145, 0.112]`) — the model cannot maintain inner/outer array depth for 40 points.
+
+**Fix (`stage2_common.py` v2.2):**
+
+| Before | After |
+|--------|-------|
+| `"points": [[0.145, 0.112], [0.146, 0.124]]` | `"points": [0.145, 0.112, 0.146, 0.124]` |
+| Nested `[` per point | Single rhythm: `num, num, num, num, ...` |
+
+- Training flattens at load time (`stage2_target_json`); **no tile regen**
+- Prompt updated to forbid nested pairs
+- Eval/middleware accept nested (GT) or flat (predictions)
+
+**Overnight pipeline:** `run_stage2_v2_2_overnight.bat`
+
+1. 500-step sanity (fresh LoRA, flat targets)
+2. Sanity gate (≥80% strict JSON on 10 tiles)
+3. If pass → 3000-step full train
+4. Holdout eval (150 tiles, `--force-json-prefix`)
+
+**95% benchmark — honest morning expectations**
+
+| Metric | v2.1 @ 500 sanity | Expected @ 3000 (v2.2) | Path to 95% |
+|--------|-------------------|------------------------|-------------|
+| Strict JSON | 20% | **70–95%** (flat removes nesting failure mode) | Prefix forcing + flat format |
+| Point match (150 holdout) | ~0% usable | **25–55%** (vision task now fair + parseable) | More steps, path-guided crops from Run 2 |
+| Normalized RMSE (matched pts) | n/a | **0.05–0.12** tile space | Fine-tune tolerance; more train data |
+| Censor F1 | 0% | **10–30%** | Separate censor head or post-process |
+
+95% overall on tile extraction is **not realistic in one night** — that target applies to the full macro pipeline. This run should deliver **parseable JSON at scale** and **first meaningful point-match rates** (10–50× above v2’s 3.1%), which is the prerequisite for iterating toward 95%.
+
+**Updated status table**
+
+| Layer | Status |
+|-------|--------|
+| Tile v2 (clinical, capped) | Eval done — 3.1% match, 0% strict JSON without prefix |
+| Tile v2 + prefix forcing | 47% strict JSON on 15-tile spot check — routing diagnosed |
+| Tile v2.1 (normalized nested) | 500-step sanity FAILED — 2/10 strict JSON |
+| Tile v2.2 (normalized flat_xy) | **3000-step eval done** — 70% strict JSON, **53.2% point match**, RMSE 0.27 |
+
+**v2.2 full run results (150 holdout tiles, 2026-06-06):**
+
+| Metric | v2 clinical | v2.2 @ 3000 |
+|--------|-------------|-------------|
+| Strict JSON | 0% | **70%** |
+| Point match | 3.1% | **53.2%** |
+| Pooled RMSE (tile space) | — | **0.272** |
+| Censor F1 (micro) | 0% | **27.1%** |
+| Train loss @ 3000 | — | 0.4875 |
+
+Log: `logs/stage2_v2_2_full_20260606_020401.log`  
+Eval: `evaluation/results/stage2_v2_1_holdout/eval_20260606T044115Z_summary.json`
+
+---
+
+### 10. Roadmap implementation (2026-06-06) — D1 complete, D2/D3 in flight
+
+Implemented the retrospective roadmap (`docs/RETROSPECTIVE.md`). Planning docs: `docs/PROJECT_CONTEXT.md`, `docs/V2_ARCHITECTURE.md`.
+
+#### Phase D1 — Measure what matters (complete, no GPU)
+
+**Parser cleanup (`evaluation/parse_output.py`)**
+
+- `repair_stage2_json()` / `extract_stage2_json()` — fixes leading/trailing commas, orphan integers at array start, missing `"censors"`, truncated bracket closure
+- Wired into `eval_stage2.py` strict parse path
+- Tests: `evaluation/test_parse_output.py` (6 passing)
+
+**Rescore (same 150-tile JSONL, no re-inference)**
+
+| Metric | Raw @ 3000 | After parser rescored |
+|--------|------------|------------------------|
+| Strict JSON | 70.0% | **77.3%** |
+| Point match | 53.2% | 54.1% |
+| Pooled RMSE | 0.272 | 0.261 |
+
+Rescore: `python eval_stage2.py --rescore-only evaluation/results/stage2_v2_1_holdout/eval_20260606T044115Z.jsonl`  
+Summary: `evaluation/results/stage2_v2_1_holdout_rescored/latest_summary.json`
+
+**Tile stitching (`scripts/stitch_tiles.py`)**
+
+- Normalized flat_xy → clinical via `_meta` + `stage2_coordinate_transform.py`
+- Overlap dedupe by clinical time (0.25 month tolerance)
+- Groups Stage 2 eval JSONL by source chart; emits verbose KM JSON per chart
+- Tests: `evaluation/test_stitch_tiles.py` (4 passing)
+
+**End-to-end eval (`eval_e2e.py`) — first benchmark number**
+
+Pipeline: holdout tile predictions → stitch per chart → score vs verbose GT (`evaluation/metrics.py`).
+
+| Metric | Score (12 charts) |
+|--------|-------------------|
+| **Overall** | **0.590** |
+| JSON valid | 100% |
+| Structure | 0.382 |
+| Numeric | 0.653 |
+| Censoring | **0.000** |
+| RMSE | 0.391 |
+
+Results: `evaluation/results/e2e/latest_summary.json`  
+Usage: `python eval_e2e.py --stage2-jsonl evaluation/results/stage2_v2_1_holdout/eval_20260606T044115Z.jsonl --max-charts 12`
+
+#### Phase D2 — Push training ceiling (in progress)
+
+**Bugfix:** `generate_stage2_tiles.py` — `--source train_1` no longer excludes all train stems (was filtering entire Phase B/C pool).
+
+**Tile regen from `train_1/`** — started 2026-06-06
+
+- Source: 12,500 KM charts from `train_1/images/km`
+- Output: `stage2_train1/`, `stage2_train1_holdout/` on external dataset root
+- Script: `run_stage2_regen_train1.bat`
+
+**Stage 2 continue 3000 → 10,000 steps** — started 2026-06-06
+
+- Resumes from `checkpoints/stage2_v2_1/final` (`--auto_resume`)
+- Checkpoint evals at 2500/5000/7500/10000
+- Script: `run_stage2_v2_2_train10k.bat`
+- Post-train on `train_1` tiles: `run_stage2_train1_10k.bat`
+
+#### Phase D3 — Real-world pipeline (infra complete; labeling pending)
+
+| File | Role |
+|------|------|
+| `train_realworld.py` | Fine-tune Phase C macro on labeled `real_dataset/` KM charts |
+| `eval_realworld.py` | Score macro checkpoint on real-world labeled holdout |
+| `run_realworld_pipeline.bat` | Scrape → label → fine-tune → eval |
+| `scripts/realworld_status.py` | Collection/labeling progress report |
+
+Status (2026-06-06): 128 curated KM images, 1129 unlabeled in queue, **0 labeled**. Targets: 250 KM / 125 forest / 125 wf.
+
+#### V2 architecture plan
+
+`docs/V2_ARCHITECTURE.md` — single-stage 7B, Perceiver projector, GRPO on coordinate RMSE, curriculum; target 0.85 E2E synthetic / 0.70 real-world.
+
+#### Updated status table
+
+| Layer | Status |
+|-------|--------|
+| Macro (Phase C Run 2) | 0.730 overall on 12-chart holdout |
+| Stage 2 v2.2 @ 3000 | 77.3% strict JSON (rescored), 53% point match |
+| **E2E (stitch)** | **0.590 overall** on 12 charts (first measured) |
+| train_1 tile regen | In progress → `stage2_train1/` |
+| Stage 2 @ 10k steps | In progress (resume from step 3000) |
+| Real-world | Infra ready; needs manual labeling |

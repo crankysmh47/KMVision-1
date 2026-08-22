@@ -40,10 +40,15 @@ def main() -> int:
     p.add_argument("--max-samples", type=int, default=5)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--max-new-tokens", type=int, default=1024)
+    p.add_argument(
+        "--force-json-prefix",
+        action="store_true",
+        help='Pre-fill assistant with {"arm_id": "<id>", "points": [ before generation.',
+    )
     args = p.parse_args()
 
     root = Path(args.dataset_root)
-    holdout = Path(args.holdout_dir or root / "stage2_v2_holdout")
+    holdout = Path(args.holdout_dir or root / "stage2_v2_1_holdout")
     image_dir = holdout / "images" / "km"
     label_dir = holdout / "labels" / "km"
     pairs = sample_pairs(
@@ -68,7 +73,10 @@ def main() -> int:
 
     model = load_model(checkpoint, device)
     strict_ok = 0
-    print(f"Checkpoint: {checkpoint}  |  tiles: {len(pairs)}\n")
+    print(f"Checkpoint: {checkpoint}  |  tiles: {len(pairs)}")
+    if args.force_json_prefix:
+        print("  force_json_prefix: ON")
+    print()
 
     for i, (img_path, label_path) in enumerate(pairs):
         with open(label_path, encoding="utf-8") as f:
@@ -82,6 +90,7 @@ def main() -> int:
             arm_id,
             device,
             max_new_tokens=args.max_new_tokens,
+            force_json_prefix=args.force_json_prefix,
         )
         pred = parse_stage2_output(raw)
         ok = (

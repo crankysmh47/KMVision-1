@@ -32,6 +32,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from evaluation.schema_compact import _cap_evenly, subsample_km_coordinates
+from stage2_common import COORDINATE_SPACE_NORMALIZED
 
 DEFAULT_DATASET_ROOT = r"C:\sem4\KMVision-1 Data\dataset"
 CATEGORY = "km"
@@ -42,6 +43,7 @@ TILE_STRIDE = TILE_SIZE - TILE_OVERLAP
 MIN_POINTS_PER_TILE = 2
 MAX_POINTS_PER_TILE = 40
 MAX_CENSORS_PER_TILE = 10
+COORD_DECIMALS = 3
 WHITE_THRESHOLD = 245
 MARGIN_SHRINK = 8
 FALLBACK_FRAC = (0.14, 0.12, 0.96, 0.22)  # left, top, right, bottom (1 - bottom = bottom inset)
@@ -198,13 +200,35 @@ def iter_tile_windows(plot: PlotBBox) -> Iterator[TileWindow]:
         x += TILE_STRIDE
 
 
-def filter_arm_points(
+def pixel_to_normalized_local(px: float, py: float, tile: TileWindow) -> List[float]:
+    """Map global 768-space pixel to [0,1] tile coords; (0,0)=top-left, (1,1)=bottom-right."""
+    x_local = px - tile.x0
+    y_local = py - tile.y0
+    x_norm = round(max(0.0, min(1.0, x_local / TILE_SIZE)), COORD_DECIMALS)
+    y_norm = round(max(0.0, min(1.0, y_local / TILE_SIZE)), COORD_DECIMALS)
+    return [x_norm, y_norm]
+
+
+def clinical_pair_to_normalized_local(
+    t: float,
+    s: float,
+    tile: TileWindow,
+    plot: PlotBBox,
+    x_max: float,
+    y_max: float,
+) -> List[float]:
+    px, py = clinical_to_pixel(t, s, plot, x_max, y_max)
+    return pixel_to_normalized_local(px, py, tile)
+
+
+def filter_arm_points_clinical(
     arm: dict,
     tile: TileWindow,
     plot: PlotBBox,
     x_max: float,
     y_max: float,
 ) -> Tuple[List[List[float]], List[List[float]]]:
+    """Points/censors in clinical (time, survival) that fall inside the tile."""
     coords = arm.get("coordinates", [])
     points: List[List[float]] = []
     for pt in coords:
@@ -223,7 +247,6 @@ def filter_arm_points(
         if pixel_in_tile(px, py, tile):
             censors.append([round(t_c, 4), round(s_c, 6)])
 
-    # Deduplicate points (same t,s)
     seen = set()
     uniq_points = []
     for p in points:
@@ -234,8 +257,31 @@ def filter_arm_points(
     return uniq_points, censors
 
 
+def clinical_lists_to_tile_space(
+    points_clinical: List[List[float]],
+    censors_clinical: List[List[float]],
+    tile: TileWindow,
+    plot: PlotBBox,
+    x_max: float,
+    y_max: float,
+    *,
+    coordinate_space: str,
+) -> Tuple[List[List[float]], List[List[float]]]:
+    if coordinate_space == COORDINATE_SPACE_NORMALIZED:
+        points = [
+            clinical_pair_to_normalized_local(t, s, tile, plot, x_max, y_max)
+            for t, s in points_clinical
+        ]
+        censors = [
+            clinical_pair_to_normalized_local(t, s, tile, plot, x_max, y_max)
+            for t, s in censors_clinical
+        ]
+        return points, censors
+    return points_clinical, censors_clinical
+
+
 def cap_tile_points(points: List[List[float]]) -> List[List[float]]:
-    """Step-aware subsample (Phase C logic), then evenly cap to MAX_POINTS_PER_TILE."""
+    """Step-aware subsample (Phase C logic on clinical t,s), then evenly cap."""
     stepwise = subsample_km_coordinates(points)
     return _cap_evenly(stepwise, MAX_POINTS_PER_TILE)
 
@@ -263,6 +309,7 @@ def process_chart(
     out_labels: Path,
     *,
     stem_prefix: str = "",
+    coordinate_space: str = COORDINATE_SPACE_NORMALIZED,
 ) -> int:
     chart = load_km_label(label_path)
     image = Image.open(img_path)
@@ -282,14 +329,25 @@ def process_chart(
 
         for arm_idx, arm in enumerate(chart.get("arms", [])):
             arm_id = str(arm.get("treatment_label", f"arm_{arm_idx}"))
-            points, censors = filter_arm_points(arm, tile, plot, x_max, y_max)
-            if len(points) < MIN_POINTS_PER_TILE:
+            points_clin, censors_clin = filter_arm_points_clinical(
+                arm, tile, plot, x_max, y_max
+            )
+            if len(points_clin) < MIN_POINTS_PER_TILE:
                 continue
 
-            n_raw_points = len(points)
-            n_raw_censors = len(censors)
-            points = cap_tile_points(points)
-            censors = cap_tile_censors(censors)
+            n_raw_points = len(points_clin)
+            n_raw_censors = len(censors_clin)
+            points_clin = cap_tile_points(points_clin)
+            censors_clin = cap_tile_censors(censors_clin)
+            points, censors = clinical_lists_to_tile_space(
+                points_clin,
+                censors_clin,
+                tile,
+                plot,
+                x_max,
+                y_max,
+                coordinate_space=coordinate_space,
+            )
 
             base = f"{source_stem}_x{tile.x0:04d}_arm{arm_idx}_{_slug(arm_id)}"
             img_out = out_images / f"{base}.png"
@@ -300,6 +358,8 @@ def process_chart(
                 "points": points,
                 "censors": censors,
                 "_meta": {
+                    "coordinate_space": coordinate_space,
+                    "coord_decimals": COORD_DECIMALS,
                     "source_chart": source_stem,
                     "source_image": str(img_path),
                     "tile_index": tile_idx,
@@ -401,8 +461,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--image_dir", type=str, default=None, help="Override image dir (ignores --source).")
     p.add_argument("--label_dir", type=str, default=None, help="Override label dir (ignores --source).")
     p.add_argument("--split_manifest", type=str, default=None, help="Default: {root}/split_manifest.json")
-    p.add_argument("--output_dir", type=str, default=None, help="Default: {root}/stage2_v2")
-    p.add_argument("--holdout_dir", type=str, default=None, help="Default: {root}/stage2_v2_holdout")
+    p.add_argument("--output_dir", type=str, default=None, help="Default: {root}/stage2_v2_1")
+    p.add_argument("--holdout_dir", type=str, default=None, help="Default: {root}/stage2_v2_1_holdout")
+    p.add_argument(
+        "--coordinate-space",
+        type=str,
+        default=COORDINATE_SPACE_NORMALIZED,
+        choices=[COORDINATE_SPACE_NORMALIZED, "clinical"],
+        help="Label coordinate system (default: normalized_local 0-1 tile space).",
+    )
     p.add_argument("--holdout_fraction", type=float, default=0.05)
     p.add_argument("--max_charts", type=int, default=12000, help="Cap source charts (default 12000).")
     p.add_argument("--seed", type=int, default=42)
@@ -429,15 +496,24 @@ def main() -> int:
             "Prefer --source testing (default)."
         )
 
-    out_root = Path(args.output_dir or root / "stage2_v2")
-    holdout_root = Path(args.holdout_dir or root / "stage2_v2_holdout")
+    if args.source == "train_1":
+        out_root = Path(args.output_dir or root / "stage2_train1")
+        holdout_root = Path(args.holdout_dir or root / "stage2_train1_holdout")
+    else:
+        out_root = Path(args.output_dir or root / "stage2_v2_1")
+        holdout_root = Path(args.holdout_dir or root / "stage2_v2_1_holdout")
     manifest_path = Path(args.split_manifest or root / "split_manifest.json")
 
-    excluded = load_phase_train_stems(root, manifest_path)
-    print(f"Phase B/C train stems to exclude: {len(excluded)}")
+    excluded: Set[str] = set()
+    if args.source == "testing":
+        excluded = load_phase_train_stems(root, manifest_path)
+        print(f"Phase B/C train stems to exclude: {len(excluded)}")
+    else:
+        print("Source train_1: using Phase B/C training pool (no stem exclusion).")
 
     pairs = collect_pairs(image_dir, label_dir)
-    pairs = filter_unused_pairs(pairs, excluded)
+    if excluded:
+        pairs = filter_unused_pairs(pairs, excluded)
     if not pairs:
         print(f"No unused image/label pairs under {image_dir} / {label_dir}")
         return 1
@@ -471,7 +547,13 @@ def main() -> int:
         total = 0
         for img_path, label_path in tqdm(split_pairs, desc=desc):
             try:
-                n = process_chart(img_path, label_path, img_out, lbl_out)
+                n = process_chart(
+                    img_path,
+                    label_path,
+                    img_out,
+                    lbl_out,
+                    coordinate_space=args.coordinate_space,
+                )
                 total += n
             except Exception as exc:
                 print(f"SKIP {label_path.name}: {exc}")
@@ -483,6 +565,8 @@ def main() -> int:
 
     manifest = {
         "category": CATEGORY,
+        "coordinate_space": args.coordinate_space,
+        "coord_decimals": COORD_DECIMALS,
         "tile_size": TILE_SIZE,
         "tile_overlap": TILE_OVERLAP,
         "max_points_per_tile": MAX_POINTS_PER_TILE,

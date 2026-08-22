@@ -7,10 +7,10 @@ Initialization: fresh LoRA + Phase A projector only (never Phase B/C or prior st
 See docs/STAGE2_DECISIONS.md.
 
 Usage:
-  # v2 sanity (500 steps, capped tiles, fresh init):
-  python train_stage2.py --max_global_steps 500
-  # full v2 run after sanity passes:
-  python train_stage2.py --max_global_steps 3000
+  # v2.1 sanity (normalized local coords, prefix-masked loss):
+  python train_stage2.py --max_global_steps 500 --no_auto_resume
+  # full v2.1 run after sanity passes:
+  python train_stage2.py --max_global_steps 3000 --no_auto_resume
 """
 
 from __future__ import annotations
@@ -34,8 +34,9 @@ from transformers import AutoProcessor, AutoTokenizer, BitsAndBytesConfig, get_l
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
-from evaluation.schema_compact import build_training_text, prompt_mask_length
+from evaluation.schema_compact import build_training_text
 from model import ClinicalMicroVLM
+from stage2_common import mask_len_through_json_prefix, stage2_target_json, stage2_user_prompt
 from scripts.training_checkpoint import (
     load_training_state,
     resolve_resume,
@@ -48,12 +49,9 @@ from scripts.training_checkpoint import (
 from scripts.training_lock import acquire_lock, release_lock
 
 DEFAULT_DATASET_ROOT = r"C:\sem4\KMVision-1 Data\dataset"
-DEFAULT_TILE_SUBDIR = "stage2_v2"
+DEFAULT_TILE_SUBDIR = "stage2_v2_1"
 PROJECTOR_INIT = ROOT / "checkpoints" / "checkpoints_projector" / "projector_weights.pth"
-STAGE2_PROMPT_TEMPLATE = (
-    "\nExtract dense coordinates and censoring ticks strictly for the '{arm_id}' "
-    "line within this image tile.\n"
-)
+
 NUM_IMAGE_TOKENS = 729  # single 384 patch, 27x27
 
 
@@ -61,18 +59,9 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def stage2_user_prompt(arm_id: str) -> str:
-    return STAGE2_PROMPT_TEMPLATE.format(arm_id=arm_id)
-
-
 def target_json_from_label(label_obj: dict) -> str:
-    """Training target excludes _meta (DECISIONS §5)."""
-    payload = {
-        "arm_id": label_obj["arm_id"],
-        "points": label_obj.get("points", []),
-        "censors": label_obj.get("censors", []),
-    }
-    return json.dumps(payload, separators=(",", ":"))
+    """Training target: flat_xy points/censors, excludes _meta."""
+    return stage2_target_json(label_obj)
 
 
 class Stage2TileDataset(Dataset):
@@ -145,8 +134,8 @@ class Stage2TileDataset(Dataset):
         input_ids = encoded.input_ids.squeeze(0)
         attention_mask = encoded.attention_mask.squeeze(0)
         labels = input_ids.clone()
-        prompt_len = prompt_mask_length(user_prompt, self.tokenizer, use_chatml=True)
-        labels[:prompt_len] = -100
+        mask_len = mask_len_through_json_prefix(user_prompt, arm_id, self.tokenizer)
+        labels[:mask_len] = -100
         labels[attention_mask == 0] = -100
 
         return {
@@ -209,7 +198,7 @@ def parse_args():
     p.add_argument("--dataset_root", type=str, default=DEFAULT_DATASET_ROOT)
     p.add_argument("--image_dir", type=str, default=None)
     p.add_argument("--label_dir", type=str, default=None)
-    p.add_argument("--output_dir", type=str, default="checkpoints/stage2_v2")
+    p.add_argument("--output_dir", type=str, default="checkpoints/stage2_v2_1")
     p.add_argument("--projector_init", type=str, default=str(PROJECTOR_INIT))
     p.add_argument("--subset_size", type=int, default=50000)
     p.add_argument("--learning_rate", type=float, default=5e-5)

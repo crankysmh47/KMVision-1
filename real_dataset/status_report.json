@@ -1,0 +1,33 @@
+{
+  "targets": {
+    "km": 250,
+    "forest": 125,
+    "wf": 125
+  },
+  "types": {
+    "km": {
+      "inbox_images": 1001,
+      "curated_images": 128,
+      "labeled": 0,
+      "unlabeled_queue": 1129,
+      "target": 250,
+      "pct_of_target": 51.2
+    },
+    "forest": {
+      "inbox_images": 0,
+      "curated_images": 0,
+      "labeled": 0,
+      "unlabeled_queue": 0,
+      "target": 125,
+      "pct_of_target": 0.0
+    },
+    "wf": {
+      "inbox_images": 0,
+      "curated_images": 0,
+      "labeled": 0,
+      "unlabeled_queue": 0,
+      "target": 125,
+      "pct_of_target": 0.0
+    }
+  }
+}
