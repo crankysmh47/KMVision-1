@@ -14,10 +14,21 @@ class KMArm(BaseModel):
     coordinates: List[Tuple[float, float]] # List of [Time, Survival_Prob] at each step drop
     censoring_ticks: List[float] # List of X-axis time points where censoring occurs
 
+class AtRiskTimepoint(BaseModel):
+    timepoint: float
+    counts: Dict[str, int] # arm label -> number at risk at that timepoint
+
 class KMChartSchema(BaseModel):
     chart_type: str = "kaplan_meier"
+    title: str
+    time_unit: str # 'months' | 'weeks' | 'days' — must match the rendered x-axis label
+    hazard_ratio: float # Cox PH, arm 1 vs reference arm (arm 0)
+    ci_lower: float # 95% CI lower bound for hazard_ratio
+    ci_upper: float # 95% CI upper bound for hazard_ratio
+    p_value: float # multivariate log-rank test across all arms
     axes: KMAxes
     arms: List[KMArm]
+    at_risk_table: List[AtRiskTimepoint] = [] # empty iff no risk table is rendered
 
 class ForestStudy(BaseModel):
     study_label: str

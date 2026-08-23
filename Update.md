@@ -542,3 +542,41 @@ transform ✓ · loud assertions ✓ · provenance ✓ · 3k/10k re-evaluated �
 validation ≥500 ✓ (this split) · **frozen synthetic test set ✗ (still owed —
 val500 is the development validation)** · real dev/frozen split exists but
 unlabeled ⚠ · per-chart metrics ✓ · no silent failures ✓.
+
+---
+
+### 13. Phase 0.5 — schema/generator extension + frozen test set (2026-08-24)
+
+**Frozen synthetic test set created** (closes the last Gate 0 checkbox):
+`scripts/make_validation_split.py --n 500 --seed 777 --exclude-manifests
+validation_manifest.json` → `frozen_test_manifest.json`. Verified 0 overlap
+with val500. Rule: evaluate on it only at formal milestones; never select
+architecture/hyperparameters on it.
+
+**KMChartSchema extended with all 6 missing fields** (`synth_dataset/schemas.py`):
+
+| Field | Source | Notes |
+|-------|--------|-------|
+| `title` | Template combinatorics over y-label × arm names | Rendered via `ax.set_title` |
+| `time_unit` | months 60% / weeks 25% / days 15% | Scales Weibull scale by {1, 4.345, 30.44}; x-label becomes "Time (unit)" so declared unit is legible in-chart |
+| `hazard_ratio` | **Cox PH fit on simulated data**, arm 1 vs reference arm | Real statistic, not sampled from a prior — always consistent with the drawn curves |
+| `ci_lower` / `ci_upper` | Cox summary exp(coef) ± 95% | Same fit |
+| `p_value` | Multivariate log-rank across all arms | Exact float (can be ~0 for strong separation) |
+| `at_risk_table` | Computed per arm at ≤8 axis-tick timepoints | End-of-period convention (`T > t`) matching lifelines' rendered counts exactly; empty iff no table rendered |
+
+Key correctness detail: lifelines' `add_at_risk_counts` renders
+end-of-period counts (`at_risk - removed` at t) at the visible xticks —
+GT uses the same convention and the same tick list, so ground truth equals
+what is printed on the chart.
+
+**New corpus**: `scripts/generate_km_v2_corpus.py` → `{dataset}/train_v2/`
+(12,000 KM-only charts, multiprocessing, maxtasksperchild=500).
+Partitioning plan: carve validation_v2 (500, seed 42) + frozen_test_v2
+(500, seed 777) manifests out of train_v2 before any v2 training; training
+excludes both. Old val500/frozen_test remain valid legacy benchmarks for
+the macro architecture comparison.
+
+**Old-data removal policy**: previous synthetic corpus (`train_1/`,
+`labels_compressed/`, old stage2 tile trees) is deleted only AFTER the new
+corpus is verified complete and partitioned — never before replacement is
+on disk.

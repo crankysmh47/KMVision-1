@@ -27,6 +27,11 @@ def main() -> int:
         "--output", default=None,
         help="Output path (default: {dataset_root}/validation_manifest.json)",
     )
+    parser.add_argument(
+        "--exclude-manifests", nargs="*", default=[],
+        help="Manifest JSON paths whose km chart IDs must NOT be sampled "
+             "(used to keep partitions disjoint).",
+    )
     args = parser.parse_args()
 
     root = Path(args.dataset_root)
@@ -62,6 +67,17 @@ def main() -> int:
                 sc = meta.get("source_chart")
                 if sc:
                     test_ids.discard(sc)
+
+    # Exclude charts claimed by other partitions (e.g. the validation manifest).
+    excluded: set[str] = set()
+    for ex_path in args.exclude_manifests:
+        ex = Path(ex_path)
+        if not ex.is_file():
+            print(f"WARNING: exclude manifest missing: {ex}")
+            continue
+        data = json.loads(ex.read_text(encoding="utf-8"))
+        excluded.update(data.get("categories", {}).get("km", []))
+    test_ids -= excluded
 
     pool = sorted(test_ids)
     rng = random.Random(args.seed)
