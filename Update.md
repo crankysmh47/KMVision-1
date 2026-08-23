@@ -478,3 +478,67 @@ results in `evaluation/results/e2e_repaired_3k/` and `e2e_repaired_10k/`):
    the remaining censor loss happens at stitch time (tile-level censors
    are spatially sparse per tile and dedupe/aggregation discards most);
    needs its own investigation, separate from the stitcher bug.
+
+---
+
+### 12. Phase 0 validation benchmark: the frozen 500-chart split (2026-08-23/24)
+
+**Split** (`scripts/make_validation_split.py`, seed 42): 500 KM charts sampled
+from `testing/`, disjoint from every prior holdout (incl. stage2 holdouts).
+3,122 oracle-boundary tiles generated for them → `stage2_validation/`.
+Frozen: no training, tuning, or architecture selection on this split.
+Runner: `scripts/run_validation_benchmark.py` (arms: `macro`, `e2e_oracle`,
+`macro_baseline`; per-chart JSONL + mean/median/stdev/P10/P90 summaries).
+
+**Hardware incident (new, blocking long runs).** The RTX 5060 Ti
+(Blackwell SM 12.0, driver 591.86, torch 2.6.0+cu124, bitsandbytes 0.45.1)
+develops **cumulative in-process CUDA corruption**: after ~16–24 generations
+one process starts raising `AcceleratorError` (misaligned address / invalid
+argument) and *every* later generation in that process fails; a fresh process
+runs the exact same charts perfectly. Not model or code — deterministic per
+process age. Retroactively explains the 2026-06-06 Ctrl+Shift+Win+B recovery.
+Workaround for eval: batch-restart loop (`--stop-after N` per process,
+incremental partial JSONL, resume skips scored charts). This is an eval-only
+mitigation — **the driver/torch/bnb stack must be fixed before Phase 1
+training** (checkpoint-corruption risk).
+
+**Macro arm (Phase C Run 2) — COMPLETE: 500/500 charts clean, 0 errors.**
+
+| Stat | overall | numeric | censoring | coord RMSE |
+|------|--------:|--------:|----------:|-----------:|
+| mean | **0.7050** | 0.5892 | 0.1378 | 0.1569 |
+| median | 0.7238 | 0.6013 | 0.1382 | 0.1568 |
+| stdev | 0.1272 | 0.1547 | 0.0370 | 0.0428 |
+| P10 / P90 | 0.6514 / 0.7828 | 0.4317 / 0.7525 | 0.1048 / 0.1767 | 0.1017 / 0.2090 |
+
+95% CI on mean overall ≈ [0.694, 0.716]. Strict JSON valid: 97.4%.
+This supersedes all previous macro numbers (0.730 was n=12).
+
+**Stage-2 E2E-oracle arm — INCOMPLETE: 14/500 clean so far.**
+
+- Runner loads `checkpoints/stage2_v2_1/final` (the v2.2 @10k lineage — same
+  family as the §11 honest numbers), tiles from `stage2_validation/`.
+- Same GPU degradation hits this arm; additionally the first batch loop ran
+  with `--no-resume` plus a completion counter that counted duplicate rows,
+  burning passes on charts 1–20. Loop killed and relaunched fixed
+  (resume on, unique-count gate, AcceleratorError → exit 3 → restart).
+- Preliminary paired result on the 14 charts scored by both arms:
+  e2e 0.7518 vs macro 0.7199 (macro wins 3/14). **This is not a reversal of
+  §11**: n=14 manifest-order survivors, paired-diff SE ≈ 0.04, and it
+  contradicts the 12-chart result more than it confirms anything. It does
+  mean the "loses by ~0.12 decisively" framing needs the full-500 error bars
+  before being treated as final.
+
+**Standing interpretation (honest).** The §11 evidence stands: both tile
+checkpoints lost to macro by ~0.12 on their own 12-chart oracle comparison,
+3k ≈ 10k, and tile-level gains did not translate E2E. Engineering-wise the
+single-stage v2 branch subsumes this pipeline regardless of whether v2.2 ties
+macro here (segmentation cost + ~6 generations/chart vs 1). But per plan Rule 1
+the deprecation record will cite the full-500 paired numbers once accumulated;
+they are running now (`logs/val500_e2e_batch4.log`).
+
+**Gate 0 checklist status (plan §3):** stitcher strict ✓ · censor inverse
+transform ✓ · loud assertions ✓ · provenance ✓ · 3k/10k re-evaluated ✓ ·
+validation ≥500 ✓ (this split) · **frozen synthetic test set ✗ (still owed —
+val500 is the development validation)** · real dev/frozen split exists but
+unlabeled ⚠ · per-chart metrics ✓ · no silent failures ✓.

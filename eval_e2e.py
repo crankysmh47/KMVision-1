@@ -50,7 +50,7 @@ def load_chart_gt(dataset_root: Path, chart_stem: str) -> Optional[dict]:
     for sub in ("testing", "train_1"):
         path = dataset_root / sub / "labels" / "km" / f"{chart_stem}.json"
         if path.is_file():
-            with open(path, encoding="utf-8") as f:
+            with open(path, encoding="utf-8", errors="replace") as f:
                 return json.load(f)
     return None
 
@@ -79,7 +79,7 @@ def run_stage2_on_chart_tiles(
         label_path = Path(rec.get("label", ""))
         if not img_path.is_file() or not label_path.is_file():
             continue
-        with open(label_path, encoding="utf-8") as f:
+        with open(label_path, encoding="utf-8", errors="replace") as f:
             label_obj = json.load(f)
         arm_id = label_obj.get("arm_id", "unknown")
         raw = generate_tile_json(

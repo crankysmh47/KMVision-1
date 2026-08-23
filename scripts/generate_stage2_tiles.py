@@ -478,12 +478,71 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Remove existing stage2/ and stage2_holdout/ tile trees before writing.",
     )
+    p.add_argument(
+        "--chart_ids_file",
+        type=str,
+        default=None,
+        help="Path to a text file of chart IDs; generates tiles ONLY for these charts "
+             "into --output_dir (no holdout split). Intended for validation sets.",
+    )
     return p.parse_args()
 
 
 def main() -> int:
     args = parse_args()
     root = Path(args.dataset_root)
+
+    # --chart-ids-file mode: generate tiles ONLY for the listed chart IDs
+    # (all into one output dir, no holdout split). Used for validation sets.
+    if getattr(args, "chart_ids_file", None):
+        ids = [
+            line.strip()
+            for line in Path(args.chart_ids_file).read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        id_set = set(ids)
+        image_dir = Path(args.image_dir) if args.image_dir else root / "testing" / "images" / "km"
+        label_dir = Path(args.label_dir) if args.label_dir else root / "testing" / "labels" / "km"
+        out_root = Path(args.output_dir or root / "stage2_validation")
+        img_out = out_root / "images" / CATEGORY
+        lbl_out = out_root / "labels" / CATEGORY
+        img_out.mkdir(parents=True, exist_ok=True)
+        lbl_out.mkdir(parents=True, exist_ok=True)
+        total = 0
+        skipped = 0
+        done = 0
+        for lf in sorted(label_dir.glob("*.json")):
+            if lf.stem not in id_set:
+                continue
+            stem = lf.stem  # e.g. chart_0026be92_km -> image file same stem
+            img_path = image_dir / f"{stem}.png"
+            if not img_path.is_file():
+                skipped += 1
+                continue
+            try:
+                total += process_chart(img_path, lf, img_out, lbl_out,
+                                       coordinate_space=getattr(args, "coordinate_space", "normalized_local"))
+            except Exception as exc:
+                print(f"SKIP {stem}: {exc}")
+                skipped += 1
+            done += 1
+            if done % 100 == 0:
+                print(f"[chart-ids] {done} charts processed, {total} tiles", flush=True)
+        manifest = {
+            "category": CATEGORY,
+            "mode": "chart_ids_file",
+            "chart_ids_file": str(args.chart_ids_file),
+            "charts_requested": len(ids),
+            "charts_processed": done,
+            "charts_skipped": skipped,
+            "tiles_written": total,
+            "output_dir": str(out_root),
+        }
+        with open(out_root / "manifest.json", "w", encoding="utf-8") as f:
+            json.dump(manifest, f, indent=2)
+        print(json.dumps(manifest, indent=2))
+        return 0
+
     if args.image_dir and args.label_dir:
         image_dir = Path(args.image_dir)
         label_dir = Path(args.label_dir)
