@@ -44,10 +44,12 @@ def main() -> int:
                   f"target={TARGET} max_passes={MAX_PASSES} ===\n")
         log.flush()
         runner = ROOT / "venv" / "Scripts" / "python.exe"
+        prev_n = -1
+        stall = 0
         for i in range(1, MAX_PASSES + 1):
             proc = subprocess.run(
                 [str(runner), str(ROOT / "scripts" / "run_validation_benchmark.py"),
-                 "--arm", "e2e_oracle", "--stop-after", "20"],
+                 "--arm", "e2e_oracle"],
                 cwd=str(ROOT), capture_output=True, text=True,
             )
             tail = "\n".join((proc.stdout + proc.stderr).splitlines()[-3:])
@@ -57,9 +59,17 @@ def main() -> int:
             if n >= TARGET:
                 log.write(f"ALL_DONE unique_clean={n}\n")
                 break
-            if proc.returncode not in (0, 3):
-                log.write(f"BAD_RC={proc.returncode} aborting\n")
-                return 1
+            # Progress-based control: stable torch removed mid-run corruption,
+            # but processes can still die (nonzero/NTSTATUS rc) at teardown.
+            # Keep restarting while coverage grows; abort only on a true stall.
+            if n > prev_n:
+                stall = 0
+            else:
+                stall += 1
+                if stall >= 3:
+                    log.write(f"STALL no progress for {stall} passes, aborting\n")
+                    return 1
+            prev_n = n
             time.sleep(5)
     return 0
 

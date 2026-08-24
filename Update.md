@@ -580,3 +580,29 @@ the macro architecture comparison.
 `labels_compressed/`, old stage2 tile trees) is deleted only AFTER the new
 corpus is verified complete and partitioned — never before replacement is
 on disk.
+
+---
+
+### 14. GPU corruption: root cause found and fixed (2026-08-24)
+
+Systematic bisection with `scripts/gpu_stress_probe.py` and
+`scripts/stress_project_pipeline.py`:
+
+| Probe | Result |
+|-------|--------|
+| Generic Qwen bf16 / NF4 generate loop (64 tok × 30) | survives |
+| Production pipeline, NF4 (real tiles) | fails ~tile 17 (`invalid argument`) |
+| Production pipeline, bf16, **no bitsandbytes** | fails ~tile 8 |
+| Same + `CUDA_LAUNCH_BLOCKING=1` | survives (timing mask) |
+| bf16 + eager attention | native heap crash during model load |
+| **Stable torch 2.11.0+cu128, production NF4 path** | **40/40 tiles survive** |
+
+Conclusion: **not bitsandbytes, not quantization, not project code** — the
+`torch 2.12.0.dev20260404+cu128` nightly build corrupted its own native heap
+asynchronously under sustained generation load (Windows STATUS_HEAP_CORRUPTION
+0xC0000374), interacting with driver 591.86 on Blackwell. Fix applied:
+pinned `torch==2.11.0+cu128` + `torchvision==0.26.0+cu128` stable wheels.
+A benign teardown-time crash can still occur after all results are flushed;
+the e2e driver now keys off coverage progress instead of exit codes.
+The batch-restart workaround remains as a belt-and-suspenders safety net
+(`AcceleratorError` → exit 3 → restart).
