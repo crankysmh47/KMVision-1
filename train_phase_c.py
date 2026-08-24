@@ -126,14 +126,22 @@ class CompactChartDataset(Dataset):
         max_samples=30000,
         seed=42,
         use_chatml=False,
+        max_length=768,
+        train_ids_file=None,
     ):
         self.processor = processor
         self.tokenizer = tokenizer
         self.use_chatml = use_chatml
+        self.max_length = max_length
         category_samples = {}
 
         if not os.path.isdir(image_dir) or not os.path.isdir(label_dir):
             raise FileNotFoundError(f"Missing {image_dir} or {label_dir}")
+
+        allowed_ids = None
+        if train_ids_file:
+            with open(train_ids_file, encoding="utf-8") as f:
+                allowed_ids = {line.strip() for line in f if line.strip()}
 
         for root, _, files in os.walk(label_dir):
             category = os.path.basename(root)
@@ -144,6 +152,8 @@ class CompactChartDataset(Dataset):
                 if not label_file.endswith(".json"):
                     continue
                 base = os.path.splitext(label_file)[0]
+                if allowed_ids is not None and base not in allowed_ids:
+                    continue
                 img_path = os.path.join(image_dir, category, f"{base}.png")
                 if not os.path.exists(img_path):
                     img_path = os.path.join(image_dir, category, f"{base}.jpg")
@@ -177,7 +187,7 @@ class CompactChartDataset(Dataset):
                 with open(label_path, encoding="utf-8", errors="replace") as f:
                     obj = json.load(f)
                 if precompressed_fits_token_budget(
-                    obj, tokenizer, use_chatml=use_chatml
+                    obj, tokenizer, use_chatml=use_chatml, max_length=self.max_length
                 ):
                     self.samples.append((img_path, label_path))
                 else:
@@ -187,7 +197,7 @@ class CompactChartDataset(Dataset):
                 _delete_corrupt_pair(img_path, label_path, exc)
 
         print(
-            f"Phase C dataset: {len(self.samples)} samples fit 768-token budget "
+            f"Phase C dataset: {len(self.samples)} samples fit {self.max_length}-token budget "
             f"({skipped_budget} over budget, {skipped_corrupt} corrupt/missing, "
             f"{num_categories} categories, chatml={use_chatml})."
         )
@@ -249,7 +259,7 @@ class CompactChartDataset(Dataset):
                 full_text,
                 truncation=True,
                 padding="max_length",
-                max_length=768,
+                max_length=self.max_length,
                 return_tensors="pt",
             )
             input_ids = encoded.input_ids.squeeze(0)
@@ -314,6 +324,18 @@ def parse_args():
     parser.add_argument("--max_global_steps", type=int, default=2000)
     parser.add_argument("--checkpoint_every", type=int, default=250)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--seq_len",
+        type=int,
+        default=768,
+        help="Training sequence budget in tokens (v2 corpus uses 1024).",
+    )
+    parser.add_argument(
+        "--train_ids_file",
+        type=str,
+        default=None,
+        help="Optional file of chart stems; only these labels are used.",
+    )
     parser.add_argument(
         "--auto_resume",
         action="store_true",
@@ -425,6 +447,8 @@ def _main_body(args):
         max_samples=args.subset_size,
         seed=args.seed,
         use_chatml=args.use_chatml,
+        max_length=args.seq_len,
+        train_ids_file=args.train_ids_file,
     )
     dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
 

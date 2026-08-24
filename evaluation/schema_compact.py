@@ -27,6 +27,13 @@ MAX_CENSORS_PER_ARM = 6
 MAX_SERIES_POINTS = 12
 MAX_WATERFALL_BARS = 30
 
+MAX_COORDS_PER_ARM_V2 = 32
+MAX_CENSORS_PER_ARM_V2 = 10
+
+
+def _is_km_v2(obj: dict) -> bool:
+    return any(k in obj for k in ("title", "time_unit", "hazard_ratio", "at_risk_table"))
+
 
 def _cap_evenly(items: list, max_n: int) -> list:
     if len(items) <= max_n:
@@ -103,16 +110,19 @@ def subsample_km_coordinates(coordinates: List[List[float]]) -> List[List[float]
 
 
 def minify_km(obj: dict) -> dict:
+    v2 = _is_km_v2(obj)
+    max_coords = MAX_COORDS_PER_ARM_V2 if v2 else MAX_COORDS_PER_ARM
+    max_censors = MAX_CENSORS_PER_ARM_V2 if v2 else MAX_CENSORS_PER_ARM
     axes = obj.get("axes", {})
     x_ax, y_ax = axes.get("x", {}), axes.get("y", {})
     arms_out = []
     for arm in obj.get("arms", []):
         coords = subsample_km_coordinates(arm.get("coordinates", []))
-        coords = [_round_coord(p) for p in _cap_evenly(coords, MAX_COORDS_PER_ARM)]
+        coords = [_round_coord(p) for p in _cap_evenly(coords, max_coords)]
         censors = _dedupe_sorted_floats(arm.get("censoring_ticks", []))
-        censors = [_round_float(v) for v in _cap_evenly(censors, MAX_CENSORS_PER_ARM)]
+        censors = [_round_float(v) for v in _cap_evenly(censors, max_censors)]
         arms_out.append({"id": arm.get("treatment_label", ""), "p": coords, "c": censors})
-    return {
+    out = {
         "ct": "km",
         "ax": {
             "x": {"l": x_ax.get("label", ""), "m": _round_float(x_ax.get("max_value", 0))},
@@ -120,6 +130,23 @@ def minify_km(obj: dict) -> dict:
         },
         "a": arms_out,
     }
+    if v2:
+        out["t"] = str(obj.get("title", ""))
+        out["u"] = str(obj.get("time_unit", "months"))
+        out["hr"] = _round_float(obj.get("hazard_ratio", 1.0), 3)
+        out["lo"] = _round_float(obj.get("ci_lower", 1.0), 3)
+        out["hi"] = _round_float(obj.get("ci_upper", 1.0), 3)
+        out["pv"] = float(obj.get("p_value", 1.0))
+        rt = obj.get("at_risk_table") or []
+        if rt:
+            out["rt"] = [
+                {
+                    "x": _round_float(tp.get("timepoint", 0)),
+                    "n": {str(k): int(v) for k, v in (tp.get("counts") or {}).items()},
+                }
+                for tp in rt
+            ]
+    return out
 
 
 def decompress_km(obj: dict) -> dict:
@@ -141,7 +168,7 @@ def decompress_km(obj: dict) -> dict:
                 "censoring_ticks": [float(v) for v in arm.get("c", [])],
             }
         )
-    return {
+    out = {
         "chart_type": "kaplan_meier",
         "axes": {
             "x": {"label": x_ax.get("l", ""), "max_value": float(x_ax.get("m", 0))},
@@ -149,6 +176,19 @@ def decompress_km(obj: dict) -> dict:
         },
         "arms": arms,
     }
+    if "t" in obj:
+        out["title"] = str(obj.get("t", ""))
+        out["time_unit"] = str(obj.get("u", "months"))
+        out["hazard_ratio"] = float(obj.get("hr", 1.0))
+        out["ci_lower"] = float(obj.get("lo", 1.0))
+        out["ci_upper"] = float(obj.get("hi", 1.0))
+        out["p_value"] = float(obj.get("pv", 1.0))
+    if "rt" in obj:
+        out["at_risk_table"] = [
+            {"timepoint": float(r.get("x", 0)), "counts": dict(r.get("n") or {})}
+            for r in obj["rt"]
+        ]
+    return out
 
 
 def minify_forest(obj: dict) -> dict:
