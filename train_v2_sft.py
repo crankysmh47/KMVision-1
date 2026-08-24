@@ -33,7 +33,7 @@ def main() -> None:
         "--train_ids_file", os.path.join(DATASET_ROOT, "train_v2_train_ids.txt"),
         "--subset_size", "11000",
         "--max_global_steps", "700",
-        "--checkpoint_every", "100",
+        "--checkpoint_every", "25",
         "--learning_rate", "3e-5",
         "--auto_resume",
     ]
